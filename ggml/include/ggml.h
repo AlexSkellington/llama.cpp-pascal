@@ -429,6 +429,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_REGULAR_HADAMARD,
+        GGML_OP_QUANTIZE_I8_CONVROT,
+
         GGML_OP_COUNT,
     };
 
@@ -1307,10 +1310,31 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * weight_scale,
+            struct ggml_tensor  * bias,
+            int                   convrot_group_size);
+
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
+
+    // Applies a normalized recursive H4 Hadamard transform independently to
+    // each contiguous group along dimension 0.
+    GGML_API struct ggml_tensor * ggml_regular_hadamard(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   group_size);
+
+    // Packs row-wise I8 activations followed by one F32 scale per row.
+    GGML_API struct ggml_tensor * ggml_quantize_i8_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   group_size);
 
     // indirect matrix multiplication
     // an id of -1 skips the slot and zeroes the matching row of the result
