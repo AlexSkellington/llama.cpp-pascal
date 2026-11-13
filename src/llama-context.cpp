@@ -19,6 +19,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1595,6 +1596,8 @@ bool llama_context::h_nextn_dev_alloc() {
         h_nextn_dev     = nullptr;
         h_nextn_dev_dev = nullptr;
         h_nextn_backend = nullptr;
+        ev_h_nextn_written.reset();
+        ev_h_nextn_read.reset();
         buf_h_nextn_dev.reset();
         ctx_h_nextn_dev.reset();
         ev_h_nextn_written_recorded = false;
@@ -1622,6 +1625,22 @@ bool llama_context::h_nextn_dev_alloc() {
         return fail("no device backend for the model output");
     }
 
+    // TP runs the target and same-model MTP draft on distinct meta streams.
+    // The meta backend has no event interface. Screen the device-resident
+    // path with scheduler fences before considering a rank-event implementation.
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        const char * enable = std::getenv("LLAMA_MTP_TENSOR_DEVICE_ROWS");
+        if (!enable || std::strcmp(enable, "1") != 0) {
+            return fail("tensor-parallel device rows are disabled");
+        }
+    } else {
+        ev_h_nextn_written.reset(ggml_backend_event_new(h_nextn_dev_dev));
+        ev_h_nextn_read.reset(ggml_backend_event_new(h_nextn_dev_dev));
+        if (!ev_h_nextn_written || !ev_h_nextn_read) {
+            return fail("the device has no events");
+        }
+    }
+
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -1635,14 +1654,6 @@ bool llama_context::h_nextn_dev_alloc() {
     buf_h_nextn_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h_nextn_dev.get(), ggml_backend_dev_buffer_type(h_nextn_dev_dev)));
     if (!buf_h_nextn_dev) {
         return fail("failed to allocate the h_nextn device buffer");
-    }
-
-    if (!ev_h_nextn_written) {
-        ev_h_nextn_written.reset(ggml_backend_event_new(h_nextn_dev_dev));
-        ev_h_nextn_read.reset(ggml_backend_event_new(h_nextn_dev_dev));
-    }
-    if (!ev_h_nextn_written || !ev_h_nextn_read) {
-        return fail("the device has no events");
     }
 
     LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB\n", __func__,
@@ -1710,6 +1721,14 @@ bool llama_context::supports_state_row() const {
     // the rows replace the host state rows, so they must have the width the graph takes for those
     const ggml_tensor * src = cparams.ctx_state_src ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr;
     if (src == nullptr || src->ne[0] != (int64_t) llama_batch_ext_select_n_embd_state(cparams.ctx_type, model.hparams)) {
+        return false;
+    }
+
+    // A TP source is mirrored across its ranks. Reuse it only when the
+    // draft shares the exact same model and tensor-parallel device.
+    if (cparams.ctx_state_src->model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            (&model != &cparams.ctx_state_src->model ||
+             !backend_from_dev(cparams.ctx_state_src->h_nextn_dev_dev))) {
         return false;
     }
 
@@ -2583,12 +2602,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
-    if (write_h_nextn) {
+    if (write_h_nextn && ev_h_nextn_written) {
         ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
         ev_h_nextn_written_recorded = true;
     }
     if (state_src) {
-        if (state_backend) {
+        if (state_backend && state_src->ev_h_nextn_read) {
             ggml_backend_event_record(state_src->ev_h_nextn_read.get(), state_backend);
             state_src->ev_h_nextn_read_recorded = true;
         } else {
