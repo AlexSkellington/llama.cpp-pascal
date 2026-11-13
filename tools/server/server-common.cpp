@@ -1176,6 +1176,11 @@ json oaicompat_completion_params_parse(const json & body) {
         throw std::runtime_error("Only no echo is supported");
     }
 
+    // local patch 0055: response_format structural_tag on /v1/completions
+    if (body.contains("response_format") && json_value(body.at("response_format"), "type", std::string()) == "structural_tag") {
+        llama_params["structured_outputs"] = json{{"structural_tag", body.at("response_format")}};
+    }
+
     // Params supported by OAI but unsupported by llama.cpp
     static const std::vector<std::string> unsupported_params { "best_of", "suffix" };
     for (const auto & param : unsupported_params) {
@@ -1392,6 +1397,8 @@ json oaicompat_chat_params_parse(
         } else if (response_type == "json_schema") {
             auto schema_wrapper = json_value(response_format, "json_schema", json::object());
             json_schema = json_value(schema_wrapper, "schema", json::object());
+        } else if (response_type == "structural_tag") {
+            llama_params["structured_outputs"] = json{{"structural_tag", response_format}}; // local patch 0055
         } else if (!response_type.empty() && response_type != "text") {
             throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
         }
@@ -1479,6 +1486,9 @@ json oaicompat_chat_params_parse(
 
     // merge the template args provided from command line with the args provided in the user request
     auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
+    if (body.contains("documents") && !body.at("documents").is_null() && !chat_template_kwargs_object.contains("documents")) {
+        chat_template_kwargs_object["documents"] = body.at("documents"); // local patch 0053: vLLM documents
+    }
     inputs.chat_template_kwargs = opt.chat_template_kwargs;
     for (const auto & item : chat_template_kwargs_object.items()) {
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
@@ -1517,7 +1527,8 @@ json oaicompat_chat_params_parse(
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
+                               json_value(body, "thinking_budget_tokens",
+                               json_value(body, "thinking_token_budget", -1))); // local patch 0053: vLLM name
         if (reasoning_budget == -1) {
             reasoning_budget = opt.reasoning_budget;
         }

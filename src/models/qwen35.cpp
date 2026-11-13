@@ -115,7 +115,21 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
         layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        {   // local patch 0045: optional reduced-vocabulary draft head (K rows of output + lab.mtp_draft_ids)
+            const int64_t kid = gguf_find_key(ml.metadata, "lab.mtp_draft_ids");
+            if (kid >= 0 && mtp_draft_ids.empty()) {
+                GGML_ASSERT(gguf_get_arr_type(ml.metadata, kid) == GGUF_TYPE_INT32);
+                const size_t n = gguf_get_arr_n(ml.metadata, kid);
+                const int32_t * d = (const int32_t *) gguf_get_arr_data(ml.metadata, kid);
+                mtp_draft_ids.assign(d, d + n);
+                for (const int32_t t : mtp_draft_ids) {
+                    GGML_ASSERT(t >= 0 && t < n_vocab);
+                }
+                LLAMA_LOG_INFO("%s: MTP draft head over %zu of %lld tokens (local patch 0045)\n", __func__, n, (long long) n_vocab);
+            }
+            const int64_t n_head_rows = mtp_draft_ids.empty() ? n_vocab : (int64_t) mtp_draft_ids.size();
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_head_rows }, mtp_flags|TENSOR_NOT_REQUIRED);
+        }
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
@@ -633,8 +647,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    // local patch 0045: LLAMA_MTP_DRAFT_VOCAB=0 drafts over the full output.weight even when a reduced head is present
+    static const bool dv_on = [] { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB"); return !(e && atoi(e) == 0); }();
+    const bool use_shh = layer.nextn.shared_head_head && (model.mtp_draft_ids.empty() || dv_on);
+    ggml_tensor * head_w = use_shh ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = use_shh ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);

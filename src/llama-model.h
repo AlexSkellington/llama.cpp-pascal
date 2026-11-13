@@ -924,6 +924,7 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
+    std::vector<int32_t> mtp_draft_ids; // local patch 0045: token ids of a reduced-vocabulary MTP draft head
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

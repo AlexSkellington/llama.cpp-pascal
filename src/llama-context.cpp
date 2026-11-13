@@ -15,6 +15,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1087,6 +1088,50 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+// local patch 0045: logits extraction that also handles a reduced-vocabulary MTP draft head (K < n_vocab rows): the K
+// values are scattered into the full row, every other token gets -inf (the same mask a grammar applies).
+// local patch 0058: logits rows known to hold the 0045 draft pattern (-inf outside the draft ids)
+static thread_local std::unordered_set<const float *> lp58_pattern_rows;
+static thread_local const int32_t * lp58_ids = nullptr;
+
+static void lp58_forget_all() {
+    lp58_pattern_rows.clear();
+}
+
+static void lp45_get_logits(ggml_backend_t be, ggml_tensor * t, float * dst, int64_t n_out, int64_t n_vocab,
+        const std::vector<int32_t> & ids) {
+    if (t->ne[0] == n_vocab) {
+        if (!lp58_pattern_rows.empty()) {
+            for (int64_t o = 0; o < n_out; ++o) {
+                lp58_pattern_rows.erase(dst + o*n_vocab); // full logits land here: no longer the draft pattern
+            }
+        }
+        ggml_backend_tensor_get_async(be, t, dst, 0, n_out*n_vocab*sizeof(float));
+        return;
+    }
+    if (lp58_ids != ids.data()) {
+        lp58_pattern_rows.clear();
+        lp58_ids = ids.data();
+    }
+    const int64_t K = t->ne[0];
+    GGML_ASSERT(K == (int64_t) ids.size());
+    static thread_local std::vector<float> tmp;
+    tmp.resize(n_out*K);
+    ggml_backend_tensor_get_async(be, t, tmp.data(), 0, n_out*K*sizeof(float));
+    ggml_backend_synchronize(be);
+    for (int64_t o = 0; o < n_out; ++o) {
+        float * row = dst + o*n_vocab;
+        if (lp58_pattern_rows.insert(row).second) {
+            std::fill(row, row + n_vocab, -INFINITY); // first use of this row: lay down the pattern once
+        }
+        const float * src = tmp.data() + o*K;
+        for (int64_t k = 0; k < K; ++k) {
+            row[ids[k]] = src[k];
+        }
+    }
+}
+
+
 float * llama_context::get_logits() {
     output_reorder();
 
@@ -1849,7 +1894,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
+        lp45_get_logits(backend_res, t_logits, logits.data, n_outputs, n_vocab, model.mtp_draft_ids);
     }
 
     // extract embeddings
@@ -2260,7 +2305,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                lp45_get_logits(backend_res, t_logits, logits_out, n_outputs, n_vocab, model.mtp_draft_ids);
             }
         }
 
@@ -2525,6 +2570,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
+        lp58_forget_all(); // local patch 0058: new output memory, no row holds the draft pattern
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));

@@ -139,6 +139,74 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// local patch 0025: packed-row path for narrow strided CONCAT; original strided address calculation.
+static bool lp0025_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LP0025"); return !(e && atoi(e) == 0); }();
+    return on;
+}
+// non-contiguous kernel (slow)
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    lp0025_concat_packed(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+           int64_t   ne01,
+           int64_t   ne02,
+           int64_t   ne03,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+           int64_t /*ne10*/,
+           int64_t /*ne11*/,
+           int64_t /*ne12*/,
+           int64_t /*ne13*/,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+           int64_t   ne0,
+           int64_t   ne1,
+           int64_t /*ne2*/,
+           int64_t /*ne3*/,
+          uint64_t   nb0,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3) {
+    static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
+
+    const int64_t i3 = blockIdx.z;
+    const int64_t i2 = blockIdx.y;
+    const T * x;
+    // lp0025: (i0, i1) flattened so one block copies many narrow rows. Host bounds n01 <= 2^30.
+    const uint32_t n0 = (uint32_t) ne0;
+    const uint32_t n01 = (uint32_t) (ne0 * ne1);
+    for (uint32_t flat = blockIdx.x * blockDim.x + threadIdx.x;
+         flat < n01; flat += blockDim.x * gridDim.x) {
+        const int64_t i1 = flat / n0;
+        const int64_t i0 = flat - (uint32_t) i1 * n0;
+        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+            x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+        } else {
+            if constexpr (dim == 0) {
+                x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+            } else if constexpr (dim == 1) {
+                x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+            } else if constexpr (dim == 2) {
+                x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+            } else if constexpr (dim == 3) {
+                x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+            }
+        }
+
+        T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+
+        *y = *x;
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -163,6 +231,27 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
+        // lp0025: only the underfilled-row case; all other operations keep the original path.
+        if (lp0025_enabled() && dim == 0 && dst->ne[0] > 0 && dst->ne[0] <= 32 &&
+                dst->ne[1] >= 128 && dst->ne[1] <= (1LL << 30) / dst->ne[0]) {
+            const int64_t n01 = dst->ne[0] * dst->ne[1];
+            const dim3 packed_grid((unsigned) ((n01 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE), dst->ne[2], dst->ne[3]);
+            static const bool trace = getenv("GGML_CUDA_LP0025_TRACE") != nullptr;
+            static thread_local int logged = 0;
+            if (trace && logged++ < 8) {
+                GGML_LOG_WARN("lp0025 concat name=%s n0=%lld n1=%lld n2=%lld n3=%lld bytes=%zu\n", dst->name,
+                    (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3], sizeof(T));
+            }
+            lp0025_concat_packed<T, 0><<<packed_grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            return;
+        }
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(

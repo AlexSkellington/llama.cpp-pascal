@@ -1926,15 +1926,19 @@ static void llama_sampler_typical_apply(struct llama_sampler * smpl, llama_token
     // Compute the softmax of logits and calculate entropy
     llama_sampler_softmax_impl(cur_p, true);
 
+    // local patch 0053: p == 0 candidates (masked by logit_bias / grammar / top-n-sigma) contribute nothing to the
+    // entropy and sort last; before, 0*log(0) = NaN made the whole ordering arbitrary
     float entropy = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        entropy += -cur_p->data[i].p * logf(cur_p->data[i].p);
+        if (cur_p->data[i].p > 0.0f) {
+            entropy += -cur_p->data[i].p * logf(cur_p->data[i].p);
+        }
     }
 
     // Compute the absolute difference between negative log probability and entropy for each candidate
     std::vector<float> shifted_scores;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        float shifted_score = fabsf(-logf(cur_p->data[i].p) - entropy);
+        float shifted_score = cur_p->data[i].p > 0.0f ? fabsf(-logf(cur_p->data[i].p) - entropy) : INFINITY;
         shifted_scores.push_back(shifted_score);
     }
 

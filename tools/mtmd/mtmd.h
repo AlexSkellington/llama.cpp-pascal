@@ -177,6 +177,13 @@ struct mtmd_video_config {
 MTMD_API struct mtmd_video_config mtmd_get_video_config(const mtmd_context * ctx,
                                                         int32_t src_width, int32_t src_height,
                                                         int32_t src_n_frames, float src_fps);
+// local patch 0055: per-request overrides (vLLM mm_processor_kwargs / media_io_kwargs); <= 0 = model default
+MTMD_API struct mtmd_video_config mtmd_get_video_config_req(const mtmd_context * ctx,
+                                                            int32_t src_width, int32_t src_height,
+                                                            int32_t src_n_frames, float src_fps,
+                                                            float req_fps, int32_t req_n_frames);
+MTMD_API void mtmd_get_image_pixel_limits(const mtmd_context * ctx, int * min_pixels, int * max_pixels);
+MTMD_API void mtmd_set_image_pixel_limits(mtmd_context * ctx, int min_pixels, int max_pixels);
 
 // get the current marker string
 MTMD_API const char * mtmd_get_marker(const mtmd_context * ctx);

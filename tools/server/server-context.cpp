@@ -256,6 +256,82 @@ struct server_batch {
     }
 };
 
+// local patch 0055: vLLM mm_processor_kwargs / media_io_kwargs -> per-request vision preprocessor pixel limits and
+// video sampling. The limits live in the shared mtmd context, so multimodal tokenization is serialized.
+static std::mutex g_vllm_mm_mutex;
+
+struct vllm_mm_scope {
+    mtmd_context * mctx = nullptr;
+    std::unique_lock<std::mutex> lk;
+    bool swapped = false;
+    int old_min = 0, old_max = 0;
+    float fps = 0.0f;
+    int32_t n_frames = 0;
+
+    vllm_mm_scope(mtmd_context * ctx, const json & data) {
+        if (ctx == nullptr) { return; }
+        const json mk = json_value(data, "mm_processor_kwargs", json());
+        const json io = json_value(data, "media_io_kwargs", json());
+        int mn = 0, mx = 0;
+        if (mk.is_object()) {
+            mn = json_value(mk, "min_pixels", 0);
+            mx = json_value(mk, "max_pixels", 0);
+            if (mk.contains("size") && mk.at("size").is_object()) {
+                mn = json_value(mk.at("size"), "shortest_edge", mn);
+                mx = json_value(mk.at("size"), "longest_edge", mx);
+            }
+            fps      = json_value(mk, "fps", 0.0f);
+            n_frames = json_value(mk, "num_frames", 0);
+        } else if (!mk.is_null()) {
+            throw std::invalid_argument("mm_processor_kwargs must be an object");
+        }
+        if (io.is_object()) {
+            if (io.contains("video") && io.at("video").is_object()) {
+                const json & v = io.at("video");
+                if (n_frames <= 0) { n_frames = json_value(v, "num_frames", 0); }
+                if (fps <= 0.0f)   { fps      = json_value(v, "fps", 0.0f); }
+            }
+        } else if (!io.is_null()) {
+            throw std::invalid_argument("media_io_kwargs must be an object");
+        }
+        if (mn < 0 || mx < 0 || fps < 0.0f || n_frames < 0) {
+            throw std::invalid_argument("mm_processor_kwargs / media_io_kwargs: values must be positive");
+        }
+        lk = std::unique_lock<std::mutex>(g_vllm_mm_mutex);
+        if (mn > 0 || mx > 0) {
+            mtmd_get_image_pixel_limits(ctx, &old_min, &old_max);
+            if (mn > 0 && mx > 0 && mx < mn) { throw std::invalid_argument("mm_processor_kwargs: max_pixels must be >= min_pixels"); }
+            int nmin = mn > 0 ? mn : old_min;
+            int nmax = mx > 0 ? mx : old_max;
+            if (mn <= 0 && nmin > nmax) { nmin = nmax; } // only max_pixels given: the model's floor follows it down
+            if (mx <= 0 && nmax < nmin) { nmax = nmin; } // only min_pixels given: the ceiling follows it up
+            mtmd_set_image_pixel_limits(ctx, nmin, nmax);
+            mctx = ctx;
+            swapped = true;
+        }
+    }
+
+    void apply(mtmd_helper_init_opt & opt) const {
+        opt.video_params.fps_request      = fps;
+        opt.video_params.n_frames_request = n_frames;
+    }
+
+    ~vllm_mm_scope() {
+        if (swapped) { mtmd_set_image_pixel_limits(mctx, old_min, old_max); }
+    }
+};
+
+static bool vllm_utf8_ok(const std::string & s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = s[i];
+        const int n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xe ? 3 : (c >> 3) == 0x1e ? 4 : 0;
+        if (n == 0 || i + n > s.size()) { return false; }
+        for (int k = 1; k < n; ++k) { if (((unsigned char) s[i + k] >> 6) != 0x2) { return false; } }
+        i += n;
+    }
+    return true;
+}
+
 struct server_slot {
     int id;
 
@@ -330,6 +406,15 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool vllm_prev_special = false; // local patch 0053: spaces_between_special_tokens
+    bool vllm_repetition   = false; // local patch 0054: repetition_detection fired
+    bool vllm_first_sent   = false; // local patch 0054: first content chunk sent
+    std::string  vllm_pend_text;    // local patch 0054: stream_interval buffer
+    llama_tokens vllm_pend_toks;
+    // local patch 0055: vLLM prompt_logprobs
+    std::vector<std::pair<int32_t, int32_t>> vllm_plp_pend; // (batch row, prompt position) waiting for the decode
+    std::vector<json> vllm_plp;
+    bool vllm_plp_want() const { return task && task->params.vllm.prompt_logprobs >= -1; }
 
     stop_type stop;
 
@@ -430,6 +515,13 @@ struct server_slot {
         last_nl_pos    = 0;
         generated      = {};
         has_new_line   = false;
+        vllm_prev_special = false;
+        vllm_repetition   = false;
+        vllm_first_sent   = false;
+        vllm_pend_text.clear();
+        vllm_pend_toks.clear();
+        vllm_plp_pend.clear();
+        vllm_plp.clear();
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
@@ -2071,6 +2163,8 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+            // local patch 0055: prompt_logprobs outputs every prompt row, backend sampling allows only a few per sequence
+            use_backend_sampling &= task.params.vllm.prompt_logprobs < -1;
 
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
@@ -2139,13 +2233,23 @@ private:
 
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
+        const auto & vllm = slot.task->params.vllm; // local patch 0053
+        if (!vllm.skip_special_tokens && vllm.spaces_between_special_tokens) {
+            // HF decode rule: added/special tokens and the text around them are joined with single spaces
+            const bool sp = (llama_vocab_get_attr(vocab, result.tok) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+            if (!slot.generated.text.empty() && !result.text_to_send.empty() && (sp || slot.vllm_prev_special)) {
+                result.text_to_send = " " + result.text_to_send;
+            }
+            slot.vllm_prev_special = sp;
+        }
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
 
         slot.generated.append(token_str, result.tok);
-        if (slot.task->params.return_tokens) {
+        if (slot.task->params.return_tokens || vllm.return_token_ids || !vllm.bad_words.empty() || vllm.rep_max > 0) {
             slot.generated_tokens.push_back(result.tok);
         }
+        const bool vllm_stop_ok = slot.stats.n_gen >= vllm.min_tokens; // vLLM: no stop before min_tokens
         slot.has_next_token = true;
 
         // check if there is incomplete UTF-8 character at the end
@@ -2158,11 +2262,11 @@ private:
             const std::string str_test = slot.generated.text.substr(pos);
             bool send_text = true;
 
-            size_t stop_pos = slot.find_stopping_strings(str_test, token_str.size(), true);
+            size_t stop_pos = vllm_stop_ok ? slot.find_stopping_strings(str_test, token_str.size(), true) : std::string::npos;
             if (stop_pos != std::string::npos) {
-                slot.generated.truncate(pos + stop_pos);
+                slot.generated.truncate(pos + stop_pos + (vllm.include_stop_str_in_output ? slot.stopping_word.size() : 0));
                 pos = std::min(slot.n_sent_text, slot.generated.text.size());
-            } else if (slot.has_next_token && !llama_vocab_is_eog(vocab, result.tok) ) {
+            } else if (vllm_stop_ok && slot.has_next_token && !llama_vocab_is_eog(vocab, result.tok) ) {
                 stop_pos = slot.find_stopping_strings(str_test, token_str.size(), false);
                 send_text = stop_pos == std::string::npos;
             }
@@ -2179,7 +2283,20 @@ private:
 
             slot.add_token(result);
             if (slot.task->params.stream) {
-                send_partial_response(slot, result, false);
+                const int si = slot.task->params.vllm.stream_interval; // local patch 0054
+                if (si <= 1) {
+                    send_partial_response(slot, result, false);
+                } else {
+                    slot.vllm_pend_text += result.text_to_send;
+                    slot.vllm_pend_toks.push_back(result.tok);
+                    if ((int) slot.vllm_pend_toks.size() >= si) {
+                        completion_token_output r = result;
+                        r.text_to_send = slot.vllm_pend_text;
+                        send_partial_response(slot, r, false);
+                        slot.vllm_pend_text.clear();
+                        slot.vllm_pend_toks.clear();
+                    }
+                }
             }
         }
 
@@ -2261,6 +2378,32 @@ private:
             SLT_DBG(slot, "%s", "stopped by EOS\n");
         }
 
+        if (!vllm.stop_token_ids.empty() && vllm_stop_ok &&
+                std::find(vllm.stop_token_ids.begin(), vllm.stop_token_ids.end(), result.tok) != vllm.stop_token_ids.end()) {
+            slot.stop           = STOP_TYPE_EOS; // local patch 0053: vLLM stop_token_ids
+            slot.has_next_token = false;
+        }
+
+        // local patch 0054: vLLM repetition_detection (v1/core/sched/utils.py check_sequence_repetition, output tokens)
+        if (vllm.rep_max > 0 && slot.has_next_token) {
+            const auto & t = slot.generated_tokens;
+            const int n = (int) t.size();
+            for (int L = std::max(1, vllm.rep_min); L <= vllm.rep_max && L * vllm.rep_count <= n; ++L) {
+                bool rep = true;
+                for (int k = 1; k <= L && rep; ++k) {
+                    for (int m = 1; m < vllm.rep_count && rep; ++m) {
+                        rep = t[n - (L * m + k)] == t[n - k];
+                    }
+                }
+                if (rep) {
+                    slot.stop            = STOP_TYPE_LIMIT;
+                    slot.has_next_token  = false;
+                    slot.vllm_repetition = true;
+                    break;
+                }
+            }
+        }
+
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
@@ -2320,6 +2463,23 @@ private:
                     cur[i].p
                 });
             }
+            // local patch 0054: vLLM logprob_token_ids - exactly these ids (full-vocab softmax), not the top-k
+            const auto & want = slot.task->params.vllm.logprob_token_ids;
+            if (!want.empty()) {
+                const float * lg = llama_get_logits_ith(ctx_tgt, idx);
+                const int n_vocab = llama_vocab_n_tokens(vocab);
+                if (lg != nullptr) {
+                    float mx = -INFINITY;
+                    for (int i = 0; i < n_vocab; ++i) { mx = std::max(mx, lg[i]); }
+                    double sum = 0.0;
+                    for (int i = 0; i < n_vocab; ++i) { sum += std::exp((double) lg[i] - mx); }
+                    result.probs.clear();
+                    for (llama_token id : want) {
+                        result.probs.push_back({id, common_token_to_piece(ctx_tgt, id, special), (float) (std::exp((double) lg[id] - mx) / sum)});
+                    }
+                    result.prob = (float) (std::exp((double) lg[result.tok] - mx) / sum);
+                }
+            }
         }
     }
 
@@ -2367,6 +2527,18 @@ private:
             res->content = slot.generated.substr(slot.n_sent_text - tkn.text_to_send.size(), tkn.text_to_send.size());
             res->tokens.assign(1, tkn.tok);
         }
+        res->vllm_include_reasoning = slot.task->params.vllm.include_reasoning; // local patch 0053 (partial)
+        res->vllm_return_token_ids  = slot.task->params.vllm.return_token_ids;
+        res->vllm_tokens_as_ids     = slot.task->params.vllm.return_tokens_as_token_ids; // local patch 0054
+        if (!is_progress && !is_begin && !slot.vllm_pend_toks.empty()) {
+            res->tokens = slot.vllm_pend_toks; // stream_interval chunk: every token id of the chunk
+        }
+        if (!is_progress && !is_begin && !slot.vllm_first_sent) {
+            slot.vllm_first_sent = true;
+            res->vllm_first      = true;
+            if (slot.task->params.vllm.return_prompt_text) { res->vllm_prompt_text = slot.task->tokens.detokenize(ctx_tgt, true); }
+            if (slot.task->params.vllm.return_token_ids)   { res->vllm_prompt_tokens = slot.task->tokens.get_text_tokens(); }
+        }
 
         res->n_decoded             = slot.stats.n_gen;
         res->n_prompt_tokens       = slot.task->n_tokens();
@@ -2404,6 +2576,14 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (slot.task->params.stream && !slot.vllm_pend_toks.empty()) { // local patch 0054: flush stream_interval buffer
+            completion_token_output r;
+            r.tok = slot.vllm_pend_toks.back();
+            r.text_to_send = slot.vllm_pend_text;
+            send_partial_response(slot, r, false);
+            slot.vllm_pend_text.clear();
+            slot.vllm_pend_toks.clear();
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2427,6 +2607,17 @@ private:
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
+        res->vllm_repetition = slot.vllm_repetition; // local patch 0054
+        if (slot.vllm_plp_want()) { // local patch 0055: one entry per prompt token, the first is null
+            json a = json::array();
+            for (int32_t i = 0; i < slot.task->n_tokens(); ++i) {
+                a.push_back(i > 0 && (size_t) i < slot.vllm_plp.size() ? slot.vllm_plp[i] : json());
+            }
+            res->vllm_prompt_logprobs = std::move(a);
+        }
+        if (slot.task->params.vllm.return_token_ids) {
+            res->vllm_prompt_tokens = slot.task->tokens.get_text_tokens();
+        }
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
@@ -4118,7 +4309,8 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                            // local patch 0055: prompt_logprobs needs logits at every position, no prefix reuse (as vLLM)
+                            if (slot.task->params.cache_prompt && !slot.task->is_stateless() && !slot.vllm_plp_want()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4515,12 +4707,16 @@ private:
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
+                            /* output    = */ slot.need_embd() || slot.vllm_plp_want(), // local patch 0055
                             /* is_prompt = */ true);
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
+                        if (slot.vllm_plp_want()) { slot.vllm_plp_pend.emplace_back(batch.size() - 1, slot.prompt.n_tokens()); }
                         slot.prompt.tokens.push_back(cur_tok);
+                        if (slot.vllm_plp_want() && slot.vllm_plp_pend.size() >= vllm_plp_budget()) {
+                            break; // local patch 0055: stay inside the context's output rows (n_outputs_max)
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4817,11 +5013,75 @@ private:
         return true;
     }
 
+    // local patch 0055: prompt-logprob rows per batch for one slot = its share of the context's output rows
+    // (server_output_limits sizes them for decoding: n_parallel * (1 + n_draft), e.g. 3 on the task models), max 512
+    size_t vllm_plp_budget() const {
+        const int32_t np = std::max(1, params_base.n_parallel);
+        return (size_t) std::max(1, std::min(512, params_base.n_outputs_max / np));
+    }
+
+    // local patch 0055: vLLM prompt logprob entry of prompt position pi + 1, from the logits of batch row idx
+    void vllm_prompt_logprob(server_slot & slot, int32_t idx, int32_t pi) {
+        const int32_t n_prompt = slot.task->n_tokens();
+        if (slot.vllm_plp.size() != (size_t) n_prompt) { slot.vllm_plp.assign(n_prompt, json()); }
+        if (pi + 1 >= n_prompt) { return; }
+        const llama_token tgt = slot.task->tokens[pi + 1];
+        if (tgt == LLAMA_TOKEN_NULL) { return; }
+        const float * lg = llama_get_logits_ith(slot.ctx_tgt, idx);
+        if (lg == nullptr) { return; }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        float mx = lg[0];
+        for (int i = 1; i < n_vocab; ++i) { mx = std::max(mx, lg[i]); }
+        double se = 0.0;
+        for (int i = 0; i < n_vocab; ++i) { se += std::exp((double) lg[i] - mx); }
+        const double lse = mx + std::log(se);
+        auto entry = [&](llama_token id, int rank) {
+            std::string piece = common_token_to_piece(slot.ctx_tgt, id, true);
+            if (!vllm_utf8_ok(piece)) { piece = "\xEF\xBF\xBD"; }
+            return json{{"logprob", (double) lg[id] - lse}, {"rank", rank}, {"decoded_token", piece}};
+        };
+        const float lt = lg[tgt];
+        int rank = 1;
+        for (int i = 0; i < n_vocab; ++i) { rank += lg[i] > lt; }
+        json e = json::object();
+        e[std::to_string(tgt)] = entry(tgt, rank);
+        int k = slot.task->params.vllm.prompt_logprobs;
+        k = k < 0 ? n_vocab : std::min(k, n_vocab);
+        if (k > 0) {
+            std::vector<llama_token> ids(n_vocab);
+            for (int i = 0; i < n_vocab; ++i) { ids[i] = i; }
+            std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](llama_token a, llama_token b) {
+                return lg[a] > lg[b] || (lg[a] == lg[b] && a < b);
+            });
+            for (int r = 0; r < k; ++r) {
+                const std::string key = std::to_string(ids[r]);
+                if (!e.contains(key)) { e[key] = entry(ids[r], r + 1); }
+            }
+        }
+        slot.vllm_plp[pi + 1] = std::move(e);
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
         };
+
+        // local patch 0055: reduce the prompt-logprob rows of this sub-batch right away
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.vllm_plp_pend.empty()) {
+                return;
+            }
+            std::vector<std::pair<int32_t, int32_t>> rest;
+            for (const auto & bp : slot.vllm_plp_pend) {
+                if (is_inside_view(bp.first)) {
+                    vllm_prompt_logprob(slot, bp.first - off, bp.second);
+                } else {
+                    rest.push_back(bp);
+                }
+            }
+            slot.vllm_plp_pend = std::move(rest);
+        });
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
@@ -4834,8 +5094,44 @@ private:
         });
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
-            return params_base.special ||
+            return params_base.special || !slot.task->params.vllm.skip_special_tokens ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+        };
+
+        // local patch 0053: vLLM min_tokens / bad_words on the logits of one sampling position. n_prefix = number of
+        // draft tokens before this position (speculative verify); output tokens so far = n_gen + n_prefix.
+        auto vllm_logits_edit = [&](server_slot & slot, int32_t idx, const llama_tokens & draft, size_t n_prefix) {
+            const auto & v = slot.task->params.vllm;
+            if (!v.logits_active()) {
+                return;
+            }
+            float * logits = llama_get_logits_ith(slot.ctx_tgt, idx);
+            if (logits == nullptr) {
+                return;
+            }
+            if ((int64_t) slot.stats.n_gen + (int64_t) n_prefix < v.min_tokens) {
+                for (llama_token t : v.eog_ids)        { logits[t] = -INFINITY; }
+                for (llama_token t : v.stop_token_ids) { logits[t] = -INFINITY; }
+            }
+            for (const auto & w : v.bad_words) {
+                const size_t L = w.size();
+                if (L == 0) {
+                    continue;
+                }
+                const size_t n_hist = slot.generated_tokens.size() + n_prefix;
+                if (L - 1 > n_hist) {
+                    continue;
+                }
+                bool match = true;
+                for (size_t i = 0; i + 1 < L && match; ++i) {
+                    const size_t hp = n_hist - (L - 1) + i;
+                    const llama_token h = hp < slot.generated_tokens.size() ? slot.generated_tokens[hp] : draft[hp - slot.generated_tokens.size()];
+                    match = h == w[i];
+                }
+                if (match) {
+                    logits[w[L - 1]] = -INFINITY;
+                }
+            }
         };
 
         iterate(slots, [&](server_slot & slot) {
@@ -4896,6 +5192,7 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
+                vllm_logits_edit(slot, tok_idx, {}, 0); // local patch 0053
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
@@ -4962,6 +5259,10 @@ private:
 
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+
+                for (size_t j = 0; j < spec_i_batch.size(); ++j) {
+                    vllm_logits_edit(slot, spec_i_batch[j], slot.spec_draft, j); // local patch 0053
+                }
 
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
@@ -5371,12 +5672,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
+        {
+        vllm_mm_scope vllm_mm(ctx_server.mctx, data); // local patch 0055: mm_processor_kwargs / media_io_kwargs
+        mtmd_helper_init_opt vllm_init_opt = ctx_server.init_opt;
+        vllm_mm.apply(vllm_init_opt);
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, vllm_init_opt));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            // local patch 0053: vLLM add_special_tokens
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, json_value(data, "add_special_tokens", true), true, vllm_init_opt);
+        }
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -5394,6 +5701,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.apply_chat_session(chat_session);
+            if (!task.params.vllm.st_grammar.empty()) { // local patch 0055: structural_tag owns the grammar
+                task.params.sampling.grammar      = {COMMON_GRAMMAR_TYPE_USER, task.params.vllm.st_grammar};
+                task.params.sampling.grammar_lazy = task.params.vllm.st_lazy;
+                task.params.sampling.grammar_triggers.clear();
+                if (task.params.vllm.st_lazy) {
+                    for (const auto & t : task.params.vllm.st_triggers) { // single-token triggers must be preserved tokens
+                        const auto ids = common_tokenize(ctx_server.vocab, t.value, false, true);
+                        if (ids.size() == 1) { task.params.sampling.preserved_tokens.insert(ids[0]); }
+                    }
+                    common_sampling_add_grammar_triggers(task.params.sampling, ctx_server.vocab, task.params.vllm.st_triggers);
+                }
+            }
+
+            // local patch 0055: prompt_logprobs on text prompts only (image/audio chunks go in as one batch)
+            if (task.params.vllm.prompt_logprobs >= -1 && task.tokens.get_text_tokens().size() != task.tokens.size()) {
+                throw std::runtime_error("prompt_logprobs is not supported with image/audio prompts");
+            }
+            // local patch 0053: vLLM truncate_prompt_tokens / truncation_side
+            if (task.params.vllm.truncate_prompt_tokens != 0) {
+                const size_t k = task.params.vllm.truncate_prompt_tokens < 0 ? (size_t) meta->slot_n_ctx : (size_t) task.params.vllm.truncate_prompt_tokens;
+                const llama_tokens all = task.tokens.get_text_tokens();
+                if (all.size() != task.tokens.size()) { // has_mtmd is set for every request on a vision model
+                    throw std::runtime_error("truncate_prompt_tokens is not supported with image/audio prompts");
+                }
+                if (all.size() > k) {
+                    llama_tokens kept = task.params.vllm.truncate_right ? llama_tokens(all.begin(), all.begin() + k) : llama_tokens(all.end() - k, all.end());
+                    task.tokens = server_tokens(kept, task.tokens.has_mtmd);
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5401,6 +5737,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
+            {   // local patch 0053: vLLM request_id -> response id
+                const std::string rid = json_value(data, "request_id", std::string());
+                if (!rid.empty()) {
+                    task.params.oaicompat_cmpl_id = (res_type == TASK_RESPONSE_TYPE_OAI_CHAT ? "chatcmpl-" : "cmpl-") + rid;
+                }
+            }
             task.params.oaicompat_model   = meta->model_name;
 
             // prepare child tasks

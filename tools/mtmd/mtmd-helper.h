@@ -28,6 +28,8 @@ struct mtmd_helper_video_init_params {
     const char * ffmpeg_bin_dir; // directory containing ffmpeg/ffprobe binaries; NULL means search PATH
     int64_t timestamp_interval_ms; // interval for adding timestamp as text chunk (example: "[10m50.5s]"); <= 0 means no timestamp, defaulted to 5000ms
     bool no_soundtrack;          // frames only, also for models that hear the soundtrack of a video (LFM3-Omni)
+    float fps_request;           // local patch 0055: per-request fps (vLLM kwargs), <= 0 = model default
+    int32_t n_frames_request;    // local patch 0055: per-request frame count, <= 0 = model default
     // TODO @ngxson : allow "placeholder" bitmap output for counting tokens
 };
 
@@ -455,6 +457,8 @@ struct mtmd_helper_video_seq {
     std::vector<float> soundtrack;
     mtmd_bitmap *      pending_audio = nullptr;
     bool          start_emitted = false;
+    float         req_fps       = 0.0f; // local patch 0055
+    int32_t       req_n_frames  = 0;
 
     mtmd_helper_video_seq() = default;
     mtmd_helper_video_seq(const mtmd_helper_video_seq &) = delete;

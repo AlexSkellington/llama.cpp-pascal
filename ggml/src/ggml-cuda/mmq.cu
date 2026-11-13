@@ -2,6 +2,10 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ggml-cuda.h"
+#include "mmf.cuh"
+#include "mmvf.cuh"
+#include "mmvq.cuh"
 
 #include <cstdint>
 
@@ -134,13 +138,23 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
 // Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
-        int * nthreads_best = nullptr) {
+        int * nthreads_best = nullptr, const bool is_moe = false) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
         if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        // local patch 0013: only the MoE caller caps Pascal J; dense/fusion callers keep wide tiles.
+        if (is_moe && J > 64 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA) {
+            continue;
+        }
+        // local patch 0032: the mid-J rows serve single-tile verify batches only. Without this, prefill chunks of types
+        // whose widest tile was 64 (Q8_0, IQ4_XS/NL, IQ3_S) picked J=72 (15 tiles instead of 16) and ran 2-13% slower.
+        if ((J == 56 || J == 72 || (J == 80 && (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS ||
+                                               type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ3_S))) && ncols > J) {
             continue;
         }
 
@@ -161,9 +175,9 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
-void ggml_cuda_mul_mat_q(
+static bool lab_mmq_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const bool fuse_glu, ggml_cuda_pool_alloc<char> * shared_pack) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -250,7 +264,7 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
         }
 
-        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
+        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best, ids != nullptr);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -264,13 +278,23 @@ void ggml_cuda_mul_mat_q(
         const int ntj = (ne1 + J_best - 1) / J_best;
 
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> private_pack(ctx.pool());
+        auto & src1_q8_1 = shared_pack ? *shared_pack : private_pack;
+        if (src1_q8_1.ptr && src1_q8_1.actual_size < nbytes_src1_q8_1) {
+            // This is the only live pool allocation carried from the first call.
+            src1_q8_1.pool->free(src1_q8_1.ptr, src1_q8_1.actual_size);
+            src1_q8_1.ptr = nullptr;
+        }
+        const bool reused_pack = src1_q8_1.ptr != nullptr;
+        if (!reused_pack) {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!reused_pack) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -281,6 +305,9 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (fuse_glu) {
+                quantize_glu_mmq_q8_1_cuda(src1, nullptr, src1_q8_1.get(), src0->type, ne10_padded,
+                                           ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -302,7 +329,7 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             ntj, J_best, fusion_device};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
-        return;
+        return reused_pack;
     }
 
     GGML_ASSERT(ne13 == 1);
@@ -362,6 +389,9 @@ void ggml_cuda_mul_mat_q(
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+        } else if (fuse_glu) {
+            quantize_glu_mmq_q8_1_cuda(src1, ids_src1.get(), src1_q8_1.get(), src0->type, ne10_padded,
+                                       ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -384,7 +414,57 @@ void ggml_cuda_mul_mat_q(
         ntj, J_best, fusion_device};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    return false;
 }
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion, const bool fuse_glu) {
+    lab_mmq_mul_mat_q(ctx, src0, src1, ids, dst, fusion, fuse_glu, nullptr);
+}
+
+bool lab_mmq_prefill_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * x = first->src[1];
+    if (cc != 610 || second->src[1] != x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
+    if (!x->buffer || ggml_backend_buffer_get_type(x->buffer) != buft) {
+        return false;
+    }
+    const int warp = ggml_cuda_info().devices[ctx.device].warp_size;
+    for (const ggml_tensor * y : {first, second}) {
+        const ggml_tensor * w = y->src[0];
+        if (!w || !w->buffer || ggml_backend_buffer_get_type(w->buffer) != buft ||
+                ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !y->buffer || ggml_backend_buffer_get_type(y->buffer) != buft || !(y->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                y->type != GGML_TYPE_F32 || y->src[2] || !ggml_is_quantized(w->type) ||
+                w->ne[0] != x->ne[0] || ggml_get_op_params_i32(y, 1) != GGML_HINT_NONE ||
+                ggml_cuda_should_use_mmvf(w->type, cc, warp, w->ne, w->nb, x->ne[1]) ||
+                ggml_cuda_should_use_mmf(w->type, cc, warp, w->ne, w->nb, x->ne[1], false) ||
+                ggml_cuda_should_use_mmvq(w->type, cc, x->ne[1]) ||
+                !ggml_cuda_should_use_mmq(w->type, cc, x->ne[1], 0) ||
+                ggml_cuda_mmq_get_prec_src1(w->type, ggml_prec_get_src(y, 1), cc) == GGML_PREC_Q4) {
+            return false;
+        }
+    }
+    if (mmq_get_q8_1_ds_layout(first->src[0]->type) != mmq_get_q8_1_ds_layout(second->src[0]->type)) {
+        return false;
+    }
+    // Storage lives only across the two original-order, same-stream matmuls.
+    ggml_cuda_pool_alloc<char> pack(ctx.pool());
+    lab_mmq_mul_mat_q(ctx, first->src[0], x, nullptr, first, nullptr, false, &pack);
+    const bool hit = lab_mmq_mul_mat_q(ctx, second->src[0], x, nullptr, second, nullptr, false, &pack);
+    static const bool trace = getenv("GGML_CUDA_LAB_MMQ_PACK_TRACE") != nullptr;
+    if (trace) {
+        fprintf(stderr, "LAB_MMQ_REUSE gpu=%d hit=%d q=%lld k=%lld layout=%d first=%s second=%s\n",
+                ctx.device, int(hit), (long long) x->ne[1], (long long) x->ne[0],
+                int(mmq_get_q8_1_ds_layout(first->src[0]->type)), first->name, second->name);
+    }
+    return true;
+}
+
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS

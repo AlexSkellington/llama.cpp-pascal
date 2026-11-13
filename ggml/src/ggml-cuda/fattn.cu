@@ -772,6 +772,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // Lab patch: the fused q8_0 tile path (Pascal) reads q8_0 directly.
+            need_f16_K = !ggml_cuda_fattn_tile_fused_q8(dst, ggml_cuda_info().devices[device].cc);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;

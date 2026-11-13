@@ -11,10 +11,34 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <functional>
 #include <cstring>
 #include <random>
 #include <unordered_map>
 #include <vector>
+
+// local patch 0015: AVX2 helper for the 0005 top-k prefilter (runtime-dispatched)
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#define LP0015_X86 1
+#include <immintrin.h>
+static bool lp0015_has_avx2() {
+    static const bool v = __builtin_cpu_supports("avx2");
+    return v;
+}
+// first i (stepping by 8 from i) whose 8-block holds a value >= thr (ordered compare, like the scalar >=); n if none
+__attribute__((target("avx2")))
+static int32_t lp0015_skip_below(const float * x, int32_t i, int32_t n, float thr) {
+    const __m256 t = _mm256_set1_ps(thr);
+    while (i + 8 <= n) {
+        if (_mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(x + i), t, _CMP_GE_OQ)) != 0) {
+            return i;
+        }
+        i += 8;
+    }
+    return i;
+}
+#endif
+
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -131,7 +155,7 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    void set_logits(struct llama_context * ctx, int idx, bool prefilter_ok = false) { // local patch 0056: caller decides
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -156,9 +180,58 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            // local patch 0005 (top-k prefilter): when the chain starts with top-k and nothing runs on the full vocab before it
+            // (no grammar, no reasoning budget, no logit bias, no n_probs), only the tokens whose logit is >= the k-th largest can
+            // survive. Find that threshold with a k-float min-heap and copy just those (ties included); the chain's own top-k then
+            // works on ~k entries instead of partial-sorting a freshly built n_vocab array. Same surviving set, ~1 MB less traffic.
+            const int32_t k = params.top_k;
+            const char * first = llama_sampler_chain_n(chain) > 0 ? llama_sampler_name(llama_sampler_chain_get(chain, 0)) : "";
+            const bool prefilter = prefilter_ok && params.mirostat == 0 && params.n_probs == 0 &&
+                                   k > 0 && k < n_vocab && strncmp(first, "top-k", 5) == 0;
+            if (prefilter) {
+                // v2: single pass. Remember every id whose logit reached the running k-th largest when it was scanned
+                // (ids 0..k-1 seed the heap). The running threshold only rises, so every id >= the final threshold is in
+                // this list, in id order: filtering it gives exactly v1's array without a second n_vocab scan.
+                topk_heap.assign(logits, logits + k);
+                std::make_heap(topk_heap.begin(), topk_heap.end(), std::greater<float>());
+                topk_cand.clear();
+                for (int32_t i = 0; i < k; i++) {
+                    topk_cand.push_back(i);
+                }
+                for (int32_t i = k; i < n_vocab; ) {
+#if defined(LP0015_X86)
+                    if (lp0015_has_avx2()) {   // local patch 0015: jump over 8-blocks with no candidate
+                        i = lp0015_skip_below(logits, i, n_vocab, topk_heap.front());
+                        if (i >= n_vocab) {
+                            break;
+                        }
+                    }
+#endif
+                    const int32_t e = std::min(n_vocab, i + 8);
+                    for (; i < e; i++) {
+                        const float l = logits[i];
+                        if (l >= topk_heap.front()) {
+                            topk_cand.push_back(i);
+                            if (l > topk_heap.front()) {
+                                std::pop_heap(topk_heap.begin(), topk_heap.end(), std::greater<float>());
+                                topk_heap.back() = l;
+                                std::push_heap(topk_heap.begin(), topk_heap.end(), std::greater<float>());
+                            }
+                        }
+                    }
+                }
+                const float thr = topk_heap.front();
+                cur.clear();
+                for (const int32_t token_id : topk_cand) {
+                    if (logits[token_id] >= thr) {
+                        cur.push_back(llama_token_data{token_id, logits[token_id], 0.0f});
+                    }
+                }
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
@@ -170,6 +243,9 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    std::vector<float>   topk_heap; // local patch 0005 scratch
+    std::vector<int32_t> topk_cand; // local patch 0005 v2 scratch
 };
 
 std::string common_params_sampling::print() const {
@@ -616,7 +692,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // local patch 0056: the first pass is passthrough for the grammar (unless grammar_first) and for a reasoning budget
+    // that is not forcing, so it may prefilter to the top-k; the resample pass below always uses the full vocab
+    const bool prefilter_ok = (!grmr || !grammar_first || !grammar_should_apply(gsmpl)) &&
+                              (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING);
+    gsmpl->set_logits(ctx, idx, prefilter_ok);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -670,7 +750,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->set_logits(ctx, idx, false); // local patch 0056: full vocab for the grammar
 
     llama_sampler_apply(rbudget,  &cur_p);
 

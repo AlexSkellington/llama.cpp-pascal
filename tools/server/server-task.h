@@ -123,6 +123,33 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // local patch 0053 (engine parity): vLLM request controls with vLLM semantics
+    struct vllm_controls {
+        int32_t min_tokens = 0;
+        std::vector<llama_token> stop_token_ids;
+        std::vector<llama_token> eog_ids;               // suppressed together with stop_token_ids under min_tokens
+        bool include_stop_str_in_output   = false;
+        bool skip_special_tokens          = true;
+        bool spaces_between_special_tokens = true;
+        bool include_reasoning            = true;
+        bool return_token_ids             = false;
+        std::vector<std::vector<llama_token>> bad_words; // full token sequences
+        int32_t truncate_prompt_tokens    = 0;           // 0 = off, -1 = context size
+        bool truncate_right               = false;
+        // local patch 0054
+        int32_t rep_max = 0, rep_min = 0, rep_count = 0;  // repetition_detection
+        bool return_prompt_text         = false;
+        bool return_tokens_as_token_ids = false;
+        std::vector<llama_token> logprob_token_ids;
+        int32_t stream_interval         = 1;
+        // local patch 0055
+        int32_t prompt_logprobs         = -2;    // -2 = off, -1 = whole vocab, k >= 0 = prompt token + top-k
+        std::string st_grammar;                  // structural_tag grammar (re-applied after the chat session)
+        bool st_lazy                    = false;
+        std::vector<common_grammar_trigger> st_triggers;
+        bool logits_active() const { return min_tokens > 0 || !bad_words.empty(); }
+    } vllm;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
@@ -433,6 +460,9 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
     common_chat_msg    oaicompat_msg; // to be populated by update()
+    bool         vllm_repetition = false; // local patch 0054: finish_reason "repetition"
+    llama_tokens vllm_prompt_tokens;      // local patch 0054: prompt_token_ids
+    json         vllm_prompt_logprobs;    // local patch 0055: prompt_logprobs
 
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
@@ -487,6 +517,12 @@ struct server_task_result_cmpl_partial : server_task_result {
     int32_t n_prompt_tokens_cache;
 
     bool post_sampling_probs;
+    bool vllm_include_reasoning = true;  // local patch 0053
+    bool vllm_return_token_ids  = false; // local patch 0053
+    bool vllm_tokens_as_ids     = false; // local patch 0054
+    bool vllm_first             = false; // local patch 0054: first content chunk (stream_interval > 1)
+    std::string  vllm_prompt_text;       // local patch 0054: first chunk only
+    llama_tokens vllm_prompt_tokens;     // local patch 0054: first chunk only
     bool is_progress = false;
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884

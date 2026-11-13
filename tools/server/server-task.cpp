@@ -363,6 +363,21 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
     };
 }
 
+// local patch 0054: vLLM output extras
+static void vllm_render_token_ids(json & content) {
+    if (!content.is_array()) { return; }
+    for (auto & e : content) {
+        if (e.contains("id")) { e["token"] = "token_id:" + std::to_string(e.at("id").get<int>()); }
+        for (const char * k : {"top_logprobs", "top_probs"}) {
+            if (e.contains(k)) {
+                for (auto & t : e[k]) {
+                    if (t.contains("id")) { t["token"] = "token_id:" + std::to_string(t.at("id").get<int>()); }
+                }
+            }
+        }
+    }
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat() {
     std::time_t t = std::time(0);
     json logprobs = json(nullptr); // OAI default to null
@@ -374,6 +389,12 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     json finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = "stop";
+    }
+    if (vllm_repetition) {
+        finish_reason = "repetition"; // local patch 0054
+    }
+    if (generation_params.vllm.return_tokens_as_token_ids && logprobs.is_object()) {
+        vllm_render_token_ids(logprobs["content"]);
     }
     json res = json {
         {"choices",            json::array({
@@ -391,6 +412,20 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
     };
+    if (generation_params.vllm.return_token_ids) {
+        res["choices"][0]["token_ids"] = tokens; // local patch 0053
+        res["choices"][0]["prompt_token_ids"] = vllm_prompt_tokens; // local patch 0054/0055: per choice in completions (vLLM)
+    }
+    if (generation_params.vllm.return_prompt_text) {
+        res["prompt_text"] = prompt; // local patch 0054
+    }
+    if (!vllm_prompt_logprobs.is_null()) { // local patch 0055: per choice in completions, top level in chat
+        if (res["object"] == "text_completion") {
+            res["choices"][0]["prompt_logprobs"] = vllm_prompt_logprobs;
+        } else {
+            res["prompt_logprobs"] = vllm_prompt_logprobs;
+        }
+    }
 
     // extra fields for debugging purposes
     if (verbose) {
@@ -415,17 +450,29 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
+    if (!generation_params.vllm.include_reasoning) {
+        msg.reasoning_content.clear(); // local patch 0053: vLLM include_reasoning=false
+    }
+    if (vllm_repetition) {
+        finish_reason = "repetition"; // local patch 0054
+    }
 
     json choice {
         {"finish_reason", finish_reason},
         {"index", index},
         {"message", msg.to_json_oaicompat()},
     };
+    if (generation_params.vllm.return_token_ids) {
+        choice["token_ids"] = tokens; // local patch 0053
+    }
 
     if (!stream && probs_output.size() > 0) {
         choice["logprobs"] = json{
             {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
         };
+        if (generation_params.vllm.return_tokens_as_token_ids) {
+            vllm_render_token_ids(choice["logprobs"]["content"]); // local patch 0054
+        }
     }
 
     std::time_t t = std::time(0);
@@ -439,6 +486,19 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
     };
+    if (generation_params.vllm.return_token_ids) {
+        res["prompt_token_ids"] = vllm_prompt_tokens; // local patch 0054
+    }
+    if (generation_params.vllm.return_prompt_text) {
+        res["prompt_text"] = prompt; // local patch 0054
+    }
+    if (!vllm_prompt_logprobs.is_null()) { // local patch 0055: per choice in completions, top level in chat
+        if (res["object"] == "text_completion") {
+            res["choices"][0]["prompt_logprobs"] = vllm_prompt_logprobs;
+        } else {
+            res["prompt_logprobs"] = vllm_prompt_logprobs;
+        }
+    }
 
     // extra fields for debugging purposes
     if (verbose) {
@@ -456,6 +516,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::string finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
+    }
+    if (vllm_repetition) {
+        finish_reason = "repetition"; // local patch 0054
     }
 
     json deltas = json::array();
@@ -1112,7 +1175,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
 }
 
 json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
-    bool first = n_decoded == 1;
+    bool first = n_decoded == 1 || vllm_first; // local patch 0054: stream_interval
     std::time_t t = std::time(0);
     json choices;
 
@@ -1142,17 +1205,36 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
     }
 
     for (const auto & diff : oaicompat_msg_diffs) {
-        add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
+        json d = server_chat_msg_diff_to_json_oaicompat(diff);
+        if (!vllm_include_reasoning && d.is_object()) {
+            d.erase("reasoning_content"); // local patch 0053: vLLM include_reasoning=false
+            if (d.empty()) {
+                continue;
+            }
+        }
+        add_delta(d);
     }
 
     if (!deltas.empty()) {
         auto & last_json = deltas[deltas.size() - 1];
         GGML_ASSERT(last_json.at("choices").size() >= 1);
+        if (vllm_return_token_ids && !tokens.empty()) {
+            last_json.at("choices").at(0)["token_ids"] = tokens; // local patch 0053
+        }
 
         if (prob_output.probs.size() > 0) {
             last_json.at("choices").at(0)["logprobs"] = json {
                 {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},
             };
+            if (vllm_tokens_as_ids) {
+                vllm_render_token_ids(last_json.at("choices").at(0)["logprobs"]["content"]); // local patch 0054
+            }
+        }
+        if (!vllm_prompt_text.empty()) {
+            deltas.front()["prompt_text"] = vllm_prompt_text; // local patch 0054: first chunk
+        }
+        if (!vllm_prompt_tokens.empty()) {
+            deltas.front()["prompt_token_ids"] = vllm_prompt_tokens; // local patch 0054: first chunk
         }
 
         if (stats.is_set()) {

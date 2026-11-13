@@ -3276,23 +3276,38 @@ int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
     return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;
 }
 
+// local patch 0055: request fps / frame count override the template's sampling
+static mtmd_video_config mtmd_video_config_init_req(mtmd_video_template tmpl, const mtmd_image_preprocessor * preproc,
+                                                    int32_t src_width, int32_t src_height,
+                                                    int32_t src_n_frames, float src_fps,
+                                                    float req_fps, int32_t req_n);
+
 mtmd_video_config mtmd_video_config_init(mtmd_video_template tmpl, const mtmd_image_preprocessor * preproc,
                                          int32_t src_width, int32_t src_height,
                                          int32_t src_n_frames, float src_fps) {
+    return mtmd_video_config_init_req(tmpl, preproc, src_width, src_height, src_n_frames, src_fps, 0.0f, 0);
+}
+
+static mtmd_video_config mtmd_video_config_init_req(mtmd_video_template tmpl, const mtmd_image_preprocessor * preproc,
+                                                    int32_t src_width, int32_t src_height,
+                                                    int32_t src_n_frames, float src_fps,
+                                                    float req_fps, int32_t req_n) {
     mtmd_video_config cfg{tmpl, 0.0f, 0, 0, 0};
     if (tmpl == MTMD_VIDEO_TEMPLATE_DEFAULT) {
+        cfg.fps      = req_fps > 0.0f ? req_fps : 0.0f;
+        cfg.n_frames = req_n > 0 ? (src_n_frames > 0 ? std::min(req_n, src_n_frames) : req_n) : 0;
         return cfg;
     }
 
     // matches Qwen3VLVideoProcessor and Lfm3VlVideoProcessor: 2 fps sampling with a [4, 768] frame clamp
     // LFM3-Omni samples at most 384 frames and hears the soundtrack
-    cfg.fps = 2.0f;
+    cfg.fps = req_fps > 0.0f ? req_fps : 2.0f;
     if (src_n_frames <= 0 || src_fps <= 0.0f) {
         return cfg;
     }
 
     int32_t n = (int32_t)((double) src_n_frames / src_fps * cfg.fps);
-    n = std::clamp(n, 4, tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI ? 384 : 768);
+    n = req_n > 0 ? req_n : std::clamp(n, 4, tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI ? 384 : 768);
     n = std::min(n, src_n_frames);
     cfg.n_frames = n;
 
@@ -3319,6 +3334,30 @@ mtmd_video_config mtmd_get_video_config(const mtmd_context * ctx,
             break;
     }
     return mtmd_video_config_init(tmpl, ctx->image_preproc.get(), src_width, src_height, src_n_frames, src_fps);
+}
+
+mtmd_video_config mtmd_get_video_config_req(const mtmd_context * ctx,
+                                            int32_t src_width, int32_t src_height,
+                                            int32_t src_n_frames, float src_fps,
+                                            float req_fps, int32_t req_n_frames) {
+    const mtmd_video_config def = mtmd_get_video_config(ctx, src_width, src_height, src_n_frames, src_fps);
+    return mtmd_video_config_init_req(def.tmpl, ctx->image_preproc.get(), src_width, src_height, src_n_frames, src_fps,
+                                      req_fps, req_n_frames);
+}
+
+void mtmd_get_image_pixel_limits(const mtmd_context * ctx, int * min_pixels, int * max_pixels) {
+    const clip_hparams * hp = ctx && ctx->ctx_v ? clip_get_hparams(ctx->ctx_v) : nullptr;
+    *min_pixels = hp ? hp->image_min_pixels : 0;
+    *max_pixels = hp ? hp->image_max_pixels : 0;
+}
+
+void mtmd_set_image_pixel_limits(mtmd_context * ctx, int min_pixels, int max_pixels) {
+    if (!ctx || !ctx->ctx_v) {
+        return;
+    }
+    auto * hp = const_cast<clip_hparams *>(clip_get_hparams(ctx->ctx_v));
+    hp->image_min_pixels = min_pixels;
+    hp->image_max_pixels = max_pixels;
 }
 
 const char * mtmd_get_marker(const mtmd_context * ctx) {

@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh" // local patch 0023 v3: original SiLU helper
 #include <cstdint>
 
 template <int block_size>
@@ -518,6 +519,225 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
             add_t, add_stride_row, add_stride_channel, add_stride_sample,
             add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream);
     }
+}
+
+// local patch 0017: fused residual add + rms_norm + mul (see apply0017.py)
+#include <climits>
+template <int block_size, int vpt>
+static __global__ void lp0017_add_rms_norm_mul_f32(const float * a, const float * b, float * sum, const float * w,
+                                                   float * dst, const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    const int      ncols4 = ncols / 4;
+    const int64_t  off4   = (int64_t) row * ncols4;
+    const float4 * a4     = (const float4 *) a + off4;
+    const float4 * b4     = (const float4 *) b + off4;
+    float4 *       sum4   = (float4 *) sum + off4;
+    const float4 * w4     = (const float4 *) w;
+    float4 *       dst4   = (float4 *) dst + off4;
+
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            const float4 p = a4[i];
+            const float4 q = b4[i];
+            xs[k] = make_float4(p.x + q.x, p.y + q.y, p.z + q.z, p.w + q.w);
+            sum4[i] = xs[k];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            const float4 m = w4[i];
+            r.x *= m.x;
+            r.y *= m.y;
+            r.z *= m.z;
+            r.w *= m.w;
+            dst4[i] = r;
+        }
+    }
+}
+
+bool lp0017_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms, ggml_tensor * mul) {
+    if (rms->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : (mul->src[1] == rms ? mul->src[0] : nullptr);
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (!w || !a || !b) {
+        return false;
+    }
+    for (const ggml_tensor * t : { a, b, (const ggml_tensor *) add, (const ggml_tensor *) rms, w, (const ggml_tensor *) mul }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_are_same_shape(mul, add)) {
+        return false;
+    }
+    const int64_t ncols = add->ne[0];
+    if (w->ne[0] != ncols || ggml_nrows(w) != 1 || ncols % 4 != 0 || ncols <= 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : { a, b, (const ggml_tensor *) add, w, (const ggml_tensor *) mul }) {
+        if (((uintptr_t) t->data & 15) != 0) {
+            return false;
+        }
+    }
+    // aliasing: every element is read and then written by the same thread (rows never cross blocks), so an output may be
+    // IDENTICAL to an input (in-place residual add) or disjoint from it. The normed output must never touch the sum or w.
+    {
+        auto lo = [](const ggml_tensor * t) { return (uintptr_t) t->data; };
+        auto hi = [](const ggml_tensor * t) { return (uintptr_t) t->data + ggml_nbytes(t); };
+        auto disjoint = [&](const ggml_tensor * x, const ggml_tensor * y) { return hi(x) <= lo(y) || hi(y) <= lo(x); };
+        auto ok_out_in = [&](const ggml_tensor * o, const ggml_tensor * in) {
+            return disjoint(o, in) || (o->data == in->data && ggml_nbytes(o) == ggml_nbytes(in));
+        };
+        if (!disjoint(mul, add) || !disjoint(mul, w) || !disjoint(add, w) ||
+            !ok_out_in(add, a) || !ok_out_in(add, b) || !ok_out_in(mul, a) || !ok_out_in(mul, b)) {
+            return false;
+        }
+    }
+    const int64_t nrows = ggml_nrows(add);
+    if (nrows <= 0 || nrows > INT_MAX) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    const float * ad = (const float *) a->data;
+    const float * bd = (const float *) b->data;
+    float *       sd = (float *) add->data;
+    const float * wd = (const float *) w->data;
+    float *       dd = (float *) mul->data;
+    cudaStream_t stream = ctx.stream();
+    const dim3 blocks_num((unsigned) nrows, 1, 1);
+    const int  n4 = (int) (ncols / 4);
+
+#define LP0017_LAUNCH(BS, VPT) \
+    do { \
+        const dim3 block_dims(BS, 1, 1); \
+        const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        ggml_cuda_kernel_launch(lp0017_add_rms_norm_mul_f32<BS, VPT>, launch_params, ad, bd, sd, wd, dd, (int) ncols, eps); \
+    } while (0)
+    // same block size / vpt choice as rms_norm_f32_dispatch's vectorised branch
+    if (n4 <= 32) {
+        LP0017_LAUNCH(32, 1);
+    } else if (n4 <= 128) {
+        LP0017_LAUNCH(128, 1);
+    } else if (n4 <= 256) {
+        LP0017_LAUNCH(256, 1);
+    } else if (n4 <= 512) {
+        LP0017_LAUNCH(512, 1);
+    } else if (n4 <= 1024) {
+        LP0017_LAUNCH(1024, 1);
+    } else if (n4 <= 4096) {
+        LP0017_LAUNCH(1024, 4);
+    } else {
+        return false;
+    }
+#undef LP0017_LAUNCH
+    return true;
+}
+
+// local patch 0023 v3: preserve the original RMS block/reduction/multiply order.
+template<int ncols, int block_size>
+static __global__ void lp0023_rms_norm_silu_mul_f32(
+        const float * x, const float * weight, const float * gate, float * dst, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t row=blockIdx.x;
+    const int tid=threadIdx.x;
+    extern __shared__ float s_sum[];
+    ggml_cuda_pdl_sync();
+    constexpr int n4=ncols/4;
+    float4 xs;
+    float tmp=0.0f;
+    if (tid<n4) {
+        xs=((const float4 *)x)[row*n4+tid];
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    }
+    tmp=block_reduce<block_reduce_method::SUM,block_size>(tmp,s_sum);
+    const float scale=rsqrtf(tmp/ncols+eps);
+    if (tid<n4) {
+        float4 r=make_float4(scale*xs.x,scale*xs.y,scale*xs.z,scale*xs.w);
+        const float4 m=((const float4 *)weight)[tid];
+        r.x*=m.x; r.y*=m.y; r.z*=m.z; r.w*=m.w;
+        const float4 g=((const float4 *)gate)[row*n4+tid];
+        r.x=ggml_cuda_op_silu_single(g.x)*r.x;
+        r.y=ggml_cuda_op_silu_single(g.y)*r.y;
+        r.z=ggml_cuda_op_silu_single(g.z)*r.z;
+        r.w=ggml_cuda_op_silu_single(g.w)*r.w;
+        ((float4 *)dst)[row*n4+tid]=r;
+    }
+}
+
+bool lp0023_gdn_gated_norm(ggml_backend_cuda_context & ctx,
+        ggml_tensor * rms, ggml_tensor * weighted, ggml_tensor * silu, ggml_tensor * out) {
+    if (ggml_get_unary_op(silu)!=GGML_UNARY_OP_SILU) return false;
+    const ggml_tensor *x=rms->src[0], *gate=silu->src[0];
+    const ggml_tensor *weight=weighted->src[0]==rms ? weighted->src[1] :
+        (weighted->src[1]==rms ? weighted->src[0] : nullptr);
+    if (!x || !gate || !weight ||
+        !((out->src[0]==weighted && out->src[1]==silu)||(out->src[1]==weighted && out->src[0]==silu))) return false;
+    for (const ggml_tensor *t : {x,gate,weight,(const ggml_tensor *)rms,(const ggml_tensor *)weighted,
+                                (const ggml_tensor *)silu,(const ggml_tensor *)out}) {
+        if (t->type!=GGML_TYPE_F32 || !ggml_is_contiguous(t)) return false;
+    }
+    const int64_t cols=x->ne[0], rows=ggml_nrows(x);
+    if ((cols!=64 && cols!=96 && cols!=128 && cols!=256 && cols!=512) || rows<1 || rows>256 ||
+        weight->ne[0]!=cols || ggml_nrows(weight)!=1) return false;
+    for (const ggml_tensor *t : {gate,(const ggml_tensor *)rms,(const ggml_tensor *)weighted,
+                                (const ggml_tensor *)silu,(const ggml_tensor *)out}) {
+        if (!ggml_are_same_shape(t,x)) return false;
+    }
+    for (const ggml_tensor *t : {x,gate,weight,(const ggml_tensor *)out}) {
+        if (((uintptr_t)t->data & 15)!=0) return false;
+    }
+    auto disjoint=[](const ggml_tensor *a,const ggml_tensor *b) {
+        const uintptr_t a0=(uintptr_t)a->data,b0=(uintptr_t)b->data;
+        return a0+ggml_nbytes(a)<=b0 || b0+ggml_nbytes(b)<=a0;
+    };
+    auto exact_or_disjoint=[&](const ggml_tensor *a,const ggml_tensor *b) {
+        return disjoint(a,b)||(a->data==b->data && ggml_nbytes(a)==ggml_nbytes(b));
+    };
+    if (!disjoint(out,weight)||!exact_or_disjoint(out,x)||!exact_or_disjoint(out,gate)) return false;
+    float eps; memcpy(&eps,rms->op_params,sizeof(eps));
+    if (!(eps>=0.0f)) return false;
+    static const bool trace=[] {const char *e=getenv("GGML_CUDA_LP0023_TRACE");return e && atoi(e)==1;}();
+    static thread_local unsigned traces=0;
+    if (trace && traces++<16) fprintf(stderr,"LP0023_MATCH device=%d shape=%lld,%lld,%lld,%lld rows=%lld\n",
+        ctx.device,(long long)cols,(long long)x->ne[1],(long long)x->ne[2],(long long)x->ne[3],(long long)rows);
+#define LP0023_LAUNCH(C,B) do { \
+    const ggml_cuda_kernel_launch_params p{dim3((unsigned)rows),dim3(B),B>32?32*sizeof(float):0,ctx.stream()}; \
+    ggml_cuda_kernel_launch(lp0023_rms_norm_silu_mul_f32<C,B>,p,(const float *)x->data, \
+        (const float *)weight->data,(const float *)gate->data,(float *)out->data,eps); \
+} while (0)
+    switch(cols) {
+        case 64: LP0023_LAUNCH(64,32); break;
+        case 96: LP0023_LAUNCH(96,32); break;
+        case 128: LP0023_LAUNCH(128,32); break;
+        case 256: LP0023_LAUNCH(256,128); break;
+        case 512: LP0023_LAUNCH(512,128); break;
+    }
+#undef LP0023_LAUNCH
+    return true;
 }
 
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {

@@ -3185,7 +3185,9 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     // note: there is no KV cache, so the KV values are the tokens of the batch, padded like the KV cache (see llama_kv_cache::get_n_kv)
-    const int64_t n_kv = GGML_PAD(n_tokens, 256);
+    // local patch 0004 (v2, post-#29510 spelling): pad only for head size >= 512 (the case #30416 fixes); BERT-family encoders
+    // (head 64) keep the unpadded [n_tokens, n_tokens] attention, which is ~1.5x faster for short rerank/embedding prompts on Pascal
+    const int64_t n_kv = hparams.n_embd_head_k_full >= 512 ? GGML_PAD(n_tokens, 256) : n_tokens;
 
     inp->self_attn_mask.raw = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
     ggml_set_input(inp->self_attn_mask.raw);
@@ -3239,11 +3241,15 @@ ggml_tensor * llm_graph_context::build_attn(
     // the KV values and the KQ bias are padded with zeros up to the KV dimension of the mask
     const int64_t n_kv_pad = kq_mask->ne[0] - k->ne[2];
 
-    k = ggml_pad(ctx0, k, 0, 0, n_kv_pad, 0);
-    v = ggml_pad(ctx0, v, 0, 0, n_kv_pad, 0);
+    // local patch 0004 (part 2): with an unpadded mask (part 1) n_kv_pad is 0, and ggml_pad would still launch a full copy
+    // of K and V in every layer (pad_f32, ~2.7% of bge-m3 GPU time); b11574 passed them straight through
+    if (n_kv_pad > 0) {
+        k = ggml_pad(ctx0, k, 0, 0, n_kv_pad, 0);
+        v = ggml_pad(ctx0, v, 0, 0, n_kv_pad, 0);
 
-    if (kq_b) {
-        kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
+        if (kq_b) {
+            kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);

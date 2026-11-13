@@ -397,7 +397,12 @@ extern "C" {
     // Meta backend
     //
 
-#define GGML_BACKEND_META_MAX_DEVICES 16
+// local patch 0057: overridable; 4 here (was 16) -> ggml_backend_meta_split_state is 592 bytes instead of 2128, and it is
+// copied by value on every split-state lookup (several per graph node on tensor-split routers). The meta device
+// constructor asserts n_devs <= GGML_BACKEND_META_MAX_DEVICES.
+#ifndef GGML_BACKEND_META_MAX_DEVICES
+#define GGML_BACKEND_META_MAX_DEVICES 4
+#endif
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:

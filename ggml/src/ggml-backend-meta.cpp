@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <set>
 #include <string>
@@ -431,7 +432,14 @@ struct ggml_backend_meta_buffer_context {
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    // local patch 0057: hash map (only find / operator[] / try_emplace / clear are used, never iteration order)
+    struct split_state_key_hash {
+        size_t operator()(const std::pair<const ggml_tensor *, bool> & k) const noexcept {
+            return std::hash<const void *>()(k.first) ^ (size_t) k.second; // tensors are aligned: bit 0 is free
+        }
+    };
+    std::unordered_map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>, split_state_key_hash>
+        split_state_cache;
 
     int debug;
 
@@ -1180,13 +1188,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
-        it = buf_ctx->split_state_cache.end();
+        // local patch 0007: a tensor whose bytes changed (e.g. the MTP draft input, 1 token while drafting / 3 while verifying)
+        // used to wipe the WHOLE cache, so every split state was recomputed ~twice per decode step. Recompute just this one:
+        // if its split state is exactly unchanged, every other entry (a function of its own bytes + its srcs' states) is still
+        // valid, so only refresh this entry. Otherwise, or if the recursion touched the cache, clear everything as before.
+        const ggml_backend_meta_split_state ss_old = it->second.first;
+        const ggml_backend_meta_split_state ss_new = calculate_split_state();
+        it = buf_ctx->split_state_cache.find(key);
+        bool same = it != buf_ctx->split_state_cache.end() && ss_new.axis == ss_old.axis && ss_new.n_segments == ss_old.n_segments;
+        for (size_t s = 0; same && s < ss_new.n_segments; s++) {
+            same = ss_new.nr[s] == ss_old.nr[s];
+            for (size_t j = 0; same && j < n_bufs; j++) {
+                same = ss_new.ne[s*n_bufs + j] == ss_old.ne[s*n_bufs + j];
+            }
+        }
+        if (same) {
+            memcpy(it->second.second, (const char *) tensor, sizeof(it->second.second));
+        } else {
+            buf_ctx->split_state_cache.clear();
+            it = buf_ctx->split_state_cache.end();
+        }
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
-        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+        // local patch 0057: compute first (the recursion may insert or clear entries), then insert once and keep the iterator
+        const ggml_backend_meta_split_state ss_calc = calculate_split_state();
+        it = buf_ctx->split_state_cache.try_emplace(key).first;
+        it->second.first = ss_calc;
+        memcpy(it->second.second, tensor, sizeof(it->second.second));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1222,7 +1251,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
     }
 
-    ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
+    if (buf_ctx->debug > 0) {
+        it = buf_ctx->split_state_cache.try_emplace(key).first; // the debug dump recursed; same as the old operator[]
+    }
+    ggml_backend_meta_split_state ret = it->second.first; // local patch 0057: no second lookup
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {

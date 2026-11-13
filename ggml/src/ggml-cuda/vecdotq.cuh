@@ -1071,6 +1071,105 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// local patch 0036: dense-MMVQ variants with one 128-bit weight load per call (VDR 4, iqs = 0,4,..,28).
+#define VDR_Q4_K_Q8_1_MMVQ_W16 4
+#define VDR_Q5_K_Q8_1_MMVQ_W16 4
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_w16(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+    const int j = iqs / 8;
+    const int h = (iqs / 4) % 2;
+    const int4 q = *((const int4 *) bq4_K->qs + iqs/4);
+    const int v[4] = {q.x, q.y, q.z, q.w};
+    int vlo[4], vhi[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        vlo[k] = (v[k] >> 0) & 0x0F0F0F0F;
+        vhi[k] = (v[k] >> 4) & 0x0F0F0F0F;
+    }
+
+    // scales / mins of sub-blocks 2j and 2j+1 (upstream's branchless unpack)
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    const int jm = j & 1;
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+    const block_q8_1 * b0 = bq8_1 + 2*j;
+    const block_q8_1 * b1 = b0 + 1;
+    const int * u0 = (const int *) b0->qs + 4*h;
+    const int * u1 = (const int *) b1->qs + 4*h;
+
+    int dot0 = 0, dot1 = 0, sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        dot0 = ggml_cuda_dp4a(vlo[k], u0[k], dot0);
+        dot1 = ggml_cuda_dp4a(vhi[k], u1[k], dot1);
+        sum0 = ggml_cuda_dp4a(0x01010101, u0[k], sum0);
+        sum1 = ggml_cuda_dp4a(0x01010101, u1[k], sum1);
+    }
+    const float d80 = __low2float(b0->ds);
+    const float d81 = __low2float(b1->ds);
+    const float2 dmf = __half22float2(bq4_K->dm);
+    return dmf.x*(d80*(dot0*sc[0]) + d81*(dot1*sc[1])) - dmf.y*(d80*(sum0*m[0]) + d81*(sum1*m[1]));
+}
+
+static __device__ __forceinline__ float vec_dot_q5_K_q8_1_w16(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    // value 64j+l takes qh bit 2j (low-nibble half), 64j+32+l takes bit 2j+1, l = 16h .. 16h+15
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
+    const int j = iqs / 8;
+    const int h = (iqs / 4) % 2;
+    const int4 q  = *((const int4 *) bq5_K->qs + iqs/4);
+    const int4 qh = *((const int4 *) bq5_K->qh + h);
+    const int v[4]  = {q.x, q.y, q.z, q.w};
+    const int vh[4] = {qh.x, qh.y, qh.z, qh.w};
+    int vlo[4], vhi[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        vlo[k] = ((v[k] >> 0) & 0x0F0F0F0F) | (((vh[k] >> (2*j + 0)) & 0x01010101) << 4);
+        vhi[k] = ((v[k] >> 4) & 0x0F0F0F0F) | (((vh[k] >> (2*j + 1)) & 0x01010101) << 4);
+    }
+
+    // scales / mins of sub-blocks 2j and 2j+1 (upstream's branchless unpack)
+    const uint16_t * scales = (const uint16_t *) bq5_K->scales;
+    const int jm = j & 1;
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+    const block_q8_1 * b0 = bq8_1 + 2*j;
+    const block_q8_1 * b1 = b0 + 1;
+    const int * u0 = (const int *) b0->qs + 4*h;
+    const int * u1 = (const int *) b1->qs + 4*h;
+
+    int dot0 = 0, dot1 = 0, sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        dot0 = ggml_cuda_dp4a(vlo[k], u0[k], dot0);
+        dot1 = ggml_cuda_dp4a(vhi[k], u1[k], dot1);
+        sum0 = ggml_cuda_dp4a(0x01010101, u0[k], sum0);
+        sum1 = ggml_cuda_dp4a(0x01010101, u1[k], sum1);
+    }
+    const float d80 = __low2float(b0->ds);
+    const float d81 = __low2float(b1->ds);
+    const float2 dmf = __half22float2(bq5_K->dm);
+    return dmf.x*(d80*(dot0*sc[0]) + d81*(dot1*sc[1])) - dmf.y*(d80*(sum0*m[0]) + d81*(sum1*m[1]));
+}
+
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1431,6 +1530,31 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
         const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
 
+        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+    }
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    sumi *= ls - 32;
+
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
+    return d * sumi;
+}
+
+// local patch 0037: dense-MMVQ IQ4_XS with two 64-bit qs loads (qs is 8-byte aligned in the 136-byte block).
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_w8(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+    const int2 qa = *((const int2 *) (bq4->qs + 4*iqs) + 0);
+    const int2 qb = *((const int2 *) (bq4->qs + 4*iqs) + 1);
+    const int aux[4] = {qa.x, qa.y, qb.x, qb.y};
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int2 v = get_int_from_table_16(aux[j], kvalues_iq4nl);
+        const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
         sumi = ggml_cuda_dp4a(v.x, u0, sumi);
         sumi = ggml_cuda_dp4a(v.y, u1, sumi);
     }

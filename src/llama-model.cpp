@@ -468,6 +468,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
+    static const std::regex pattern_lp45_draft_head("blk\\.\\d+\\.nextn\\.shared_head_head\\.weight"); // local patch 0045
 
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -657,6 +658,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL, "ffn_down_exps.weight");
         }
 
+        // local patch 0045: the reduced-vocabulary MTP draft head is split by rows like output.weight
+        if (!ud->model->mtp_draft_ids.empty() && std::regex_match(tensor_name, pattern_lp45_draft_head)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
             if (is_dsv4) {

@@ -877,7 +877,9 @@ struct mtmd_helper_video : mtmd_helper_video_seq {
 
         mtmd_video_config cfg{MTMD_VIDEO_TEMPLATE_DEFAULT, 0.0f, 0, 0, 0};
         if (use_video_config) {
-            cfg = mtmd_get_video_config(mctx, src.width, src.height, src.n_frames, src.fps);
+            cfg = (req_fps > 0.0f || req_n_frames > 0) // local patch 0055
+                ? mtmd_get_video_config_req(mctx, src.width, src.height, src.n_frames, src.fps, req_fps, req_n_frames)
+                : mtmd_get_video_config(mctx, src.width, src.height, src.n_frames, src.fps);
         }
         configure(cfg, src, fps_target_arg);
         return true;
@@ -1068,6 +1070,8 @@ mtmd_helper_video_init_params mtmd_helper_video_init_params_default() {
         /* ffmpeg_bin_dir         */ nullptr,
         /* timestamp_interval_ms  */ 5000,
         /* no_soundtrack          */ false,
+        /* fps_request            */ 0.0f,
+        /* n_frames_request       */ 0,
     };
 }
 
@@ -1142,6 +1146,8 @@ mtmd_helper_video * mtmd_helper_video_init(
     ctx->ffprobe_bin          = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
     ctx->use_video_config      = true;
+    ctx->req_fps               = params.fps_request;      // local patch 0055
+    ctx->req_n_frames          = params.n_frames_request;
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, path);
@@ -1181,6 +1187,8 @@ mtmd_helper_video * mtmd_helper_video_init_from_buf(
     ctx->ffprobe_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
     ctx->use_video_config      = true;
+    ctx->req_fps               = params.fps_request;      // local patch 0055
+    ctx->req_n_frames          = params.n_frames_request;
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);

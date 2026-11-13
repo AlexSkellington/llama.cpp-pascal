@@ -1,4 +1,13 @@
 #include "mmvq.cuh"
+#if __has_include("mmvq-moe-tune.h")
+#include "mmvq-moe-tune.h"
+#endif
+#if __has_include("mmvq-autotune.h")
+#include "mmvq-autotune.h"
+#endif
+#if __has_include("mmvq-pascal-tune.h")
+#include "mmvq-pascal-tune.h"
+#endif
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -91,6 +100,23 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
     }
+}
+
+// local patch 0036: the DENSE MMVQ kernel uses 128-bit-load variants for Q4_K / Q5_K; the MoE kernel keeps the originals.
+static constexpr __host__ __device__ int get_vdr_mmvq_dense(ggml_type type) {
+    return type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_W16 : type == GGML_TYPE_Q5_K ? VDR_Q5_K_Q8_1_MMVQ_W16 : get_vdr_mmvq(type);
+}
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_dense(ggml_type type) {
+    return type == GGML_TYPE_Q4_K ? vec_dot_q4_K_q8_1_w16 : type == GGML_TYPE_Q5_K ? vec_dot_q5_K_q8_1_w16 :
+           type == GGML_TYPE_IQ4_XS ? vec_dot_iq4_xs_q8_1_w8 /* 0037 */ : get_vec_dot_q_cuda(type);
+}
+
+// local patch 0038 (q4k): MoE-kernel switch -- 128-bit loads for Q4_K only.
+static constexpr __host__ __device__ int get_vdr_mmvq_moe(ggml_type type) {
+    return type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_W16 : get_vdr_mmvq(type);
+}
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_moe(ggml_type type) {
+    return type == GGML_TYPE_Q4_K ? vec_dot_q4_K_q8_1_w16 : get_vec_dot_q_cuda(type);
 }
 
 enum mmvq_parameter_table_id {
@@ -452,6 +478,16 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+#ifdef MMVQ_AUTOTUNE
+        if (const int w = mmvq_at_nw(type, ncols_dst, small_k, halve_iters); w > 0) {
+            return w;
+        }
+#endif
+#ifdef MMVQ_PASCAL_TUNE
+        if (type == GGML_TYPE_Q8_0 && !small_k && ncols_dst >= 1 && ncols_dst <= 4) {
+            return ncols_dst == 1 ? MMVQ_PT_NW1 : MMVQ_PT_NW24;
+        }
+#endif
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -594,6 +630,18 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+#ifdef MMVQ_AUTOTUNE
+    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        if (const int r = mmvq_at_rpb(type, ncols_dst, small_k, nwarps); r > 0) {
+            return r;
+        }
+    }
+#endif
+#ifdef MMVQ_PASCAL_TUNE
+    if (table_id == MMVQ_PARAMETERS_GENERIC && type == GGML_TYPE_Q8_0 && !small_k && ncols_dst >= 1 && ncols_dst <= 4) {
+        return ncols_dst == 1 ? MMVQ_PT_RPB1 : MMVQ_PT_RPB24;
+    }
+#endif
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -635,13 +683,13 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int vdr = get_vdr_mmvq_dense(type); // 0036
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda_dense(type); // 0036
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -878,7 +926,7 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, int c_g = 1>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -894,10 +942,13 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int vdr = get_vdr_mmvq_moe(type); // 0038
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    // local patch 0011: c_g lane groups per warp, each on its own rows (c_g == 1: lane == threadIdx.x, upstream)
+    const int lane   = threadIdx.x % (warp_size/c_g);
+    const int lane_g = threadIdx.x / (warp_size/c_g);
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda_moe(type); // 0038
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
@@ -930,7 +981,7 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      row0        = c_rows_per_block*(c_g*blockIdx.x + lane_g);
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
@@ -951,9 +1002,9 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter/c_g) {
         const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+        const int kqs = vdr * (lane % (qi/vdr));
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
@@ -971,19 +1022,19 @@ static __global__ void mul_mat_vec_q_moe(
     // Warp-level reduction only - no shared memory needed
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        tmp[i] = warp_reduce_sum<warp_size/c_g>(tmp[i]);
         if constexpr (has_fusion) {
             if (use_gate) {
-                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+                tmp_gate[i] = warp_reduce_sum<warp_size/c_g>(tmp_gate[i]);
             }
         }
     }
 
     // Write results
-    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        float result = tmp[threadIdx.x];
+    if (lane < c_rows_per_block && (c_rows_per_block*c_g == 1 || uint32_t(row0 + lane) < nrows_x)) {
+        float result = tmp[lane];
         if constexpr (has_fusion) {
-            const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
+            const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + lane;
 
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (x_scale) {
@@ -994,7 +1045,7 @@ static __global__ void mul_mat_vec_q_moe(
                 result += x_bias[bias_idx];
             }
             if (use_gate) {
-                float gate_value = tmp_gate[threadIdx.x];
+                float gate_value = tmp_gate[lane];
                 if constexpr (type == GGML_TYPE_NVFP4) {
                     if (gate_scale) {
                         gate_value *= gate_scale[channel_x];
@@ -1022,7 +1073,7 @@ static __global__ void mul_mat_vec_q_moe(
                 }
             }
         }
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + lane] = result;
     }
 
     if constexpr (!has_fusion) {
@@ -1085,7 +1136,11 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
+#ifdef MMVQ_PT_MOE_RPB
+    constexpr int rows_per_block = MMVQ_PT_MOE_RPB;
+#else
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+#endif
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
     const dim3 block_dims(warp_size, ncols_dst);
@@ -1093,7 +1148,30 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-
+#ifdef MMVQ_MOE_LANEGROUPS
+    {   // local patch 0011: tiny K -> G lane groups per warp, each on its own rows (bit-identical)
+        const int bpi = get_vdr_mmvq_moe(type) * warp_size / ggml_cuda_type_traits<type>::qi; // 0038   // K blocks per warp pass
+        const int bpr = int(ncols_x / ggml_cuda_type_traits<type>::qk);
+        const auto go = [&](auto g_tag) {
+            constexpr int G = decltype(g_tag)::value;
+            const dim3 bn((nrows_x + rows_per_block*G - 1) / (rows_per_block*G), nchannels_dst + (fusion.shared_up != nullptr));
+            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(bn, block_dims, 0, stream);
+            if (has_fusion) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, G>, lp,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, G>, lp,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
+            }
+        };
+        if (mmvq_moe_listed(type) && fusion.shared_up == nullptr) {
+            if (bpr * 4 <= bpi && nrows_x % (rows_per_block*4) == 0) { go(std::integral_constant<int, 4>{}); return; }
+            if (bpr * 2 <= bpi && nrows_x % (rows_per_block*2) == 0) { go(std::integral_constant<int, 2>{}); return; }
+        }
+    }
+#endif
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
@@ -1136,7 +1214,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
     constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr                   = get_vdr_mmvq(type);
+    constexpr int vdr                   = get_vdr_mmvq_dense(type); // 0036
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
@@ -1234,6 +1312,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if (should_use_small_k(c_ncols_dst)) {
+#ifdef MMVQ_AUTOTUNE
+                if constexpr (mmvq_at_tiny(type)) {
+                    if (table_id == MMVQ_PARAMETERS_GENERIC && blocks_per_row_x <= blocks_per_iter_1warp) {
+                        launch(std::true_type{}, std::true_type{});   // local patch 0010: tiny K -> 1 warp, bit-identical
+                        break;
+                    }
+                }
+#endif
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
@@ -1453,9 +1539,10 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
-void ggml_cuda_mul_mat_vec_q(
+// local patch 0018: optional caller-owned Q8_1 activation (quantized once for several matmuls on the same input)
+static void lp0018_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const void * quantized_src1) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1550,12 +1637,14 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!quantized_src1) {
+        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantized_src1 = src1_q8_1.get();
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1581,10 +1670,31 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, quantized_src1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+void ggml_cuda_mul_mat_vec_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    lp0018_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, nullptr);
+}
+
+// local patch 0018: quantize nodes[0]->src[1] once, then run each node's ORIGINAL MMVQ on it, in the given order.
+// The caller has validated every node (same src1, MMVQ-eligible, no aliasing). The buffer outlives all launches.
+void lp0018_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n) {
+    const ggml_tensor * x = nodes[0]->src[1];
+    const int64_t padded = GGML_PAD(x->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> q(ctx.pool(), x->ne[3]*x->ne[2]*x->ne[1]*padded*sizeof(block_q8_1)/QK8_1);
+    const size_t ts = ggml_type_size(x->type);
+    quantize_row_q8_1_cuda((const float *) x->data, nullptr, q.get(), nodes[0]->src[0]->type,
+            x->ne[0], x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts, padded, x->ne[1], x->ne[2], x->ne[3], ctx.stream());
+    for (int k = 0; k < n; k++) {
+        GGML_ASSERT(nodes[k]->src[1] == x);
+        lp0018_mul_mat_vec_q_impl(ctx, nodes[k]->src[0], x, nodes[k]->src[2], nodes[k], nullptr, q.get());
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

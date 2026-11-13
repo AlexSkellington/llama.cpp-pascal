@@ -460,7 +460,17 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // local patch 0014: nothing of seq_id in [p0, p1) -> nothing to remove, head unchanged
+        {
+            const llama_pos smin = cells.seq_pos_min(seq_id);
+            if (smin < 0 || smin >= p1 || cells.seq_pos_max(seq_id) < p0) {
+                return true;
+            }
+        }
+
+        // local patch 0014: only used cells can be in [p0, p1) (empty cells have pos -1)
+        const uint32_t i_end = cells.used_max_p1();
+        for (uint32_t i = cells.used_min(); i < i_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -484,7 +494,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            // local patch 0014: only used cells can be in [p0, p1)
+            const uint32_t i_end = cells.used_max_p1();
+            for (uint32_t i = cells.used_min(); i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }

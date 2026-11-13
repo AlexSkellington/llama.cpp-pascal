@@ -983,7 +983,13 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+// lp0022: GGML_CUDA_LP0022=0 disables the F16-KV parallel_blocks=1 start (see apply0022.py)
+static bool lp0022_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LP0022"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
+template <int DV, int ncols1, int ncols2, bool fold_gqa = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
@@ -1103,8 +1109,12 @@ void launch_fattn(
         }
     }
 
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    // lp0024: compile-time opt-in keeps every legacy launch unchanged.
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    static_assert(!fold_gqa || (DV == 256 && ncols2 == 8), "invalid lp0024 launch");
+    GGML_ASSERT(!fold_gqa || (gqa_ratio == 6 && !stream_k && !use_sparse && !need_f16_K && !need_f16_V));
+    constexpr int ncols1_eff = fold_gqa ? ncols/6 : ncols1;
+    const int ntiles_x     = ((Q->ne[1] + ncols1_eff - 1) / ncols1_eff);
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
@@ -1125,7 +1135,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
-    const bool scan_mask = !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+    const bool scan_mask = !fold_gqa && !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1209,6 +1219,18 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
+        // lp0022 v2: with F16 K/V (vision towers) and enough output tiles to fill the GPU many times over, a KV split
+        // buys little occupancy but needs a parallel_blocks x |KQV| fp32 temporary. Keep the split when that temporary
+        // fits with a 256 MiB margin (it is ~1% faster on Pascal); otherwise start at 1 instead of running out of memory.
+        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && parallel_blocks > 1 &&
+                ntiles_dst >= 8*nsm*max_blocks_per_sm && lp0022_enabled()) {
+            const size_t need = size_t(parallel_blocks) * (size_t(ggml_nelements(KQV))*sizeof(float) + size_t(ggml_nrows(KQV))*sizeof(float2));
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need + (size_t(256) << 20)) {
+                parallel_blocks = 1;
+            }
+        }
+
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
@@ -1263,6 +1285,18 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+
+    if constexpr (fold_gqa) {
+        static const bool trace = [] { const char * e = getenv("GGML_CUDA_LP0024_TRACE"); return e && strcmp(e, "1") == 0; }();
+        static thread_local unsigned traced = 0;
+        const int id = ggml_cuda_get_device();
+        if (trace && id >= 0 && id < 32 && !(traced & (1u << id))) {
+            traced |= 1u << id;
+            GGML_LOG_WARN("lp0024 LAUNCH gpu=%d kv=%lld q=%lld qheads=%lld kvheads=%lld seq=%lld cols=%d qcols=%d grid=%u,%u,%u block=%u,%u,%u scan_mask=%d\n",
+                id, (long long) K->ne[1], (long long) Q->ne[1], (long long) Q->ne[2], (long long) K->ne[2], (long long) Q->ne[3],
+                ncols, ncols1_eff, blocks_num.x, blocks_num.y, blocks_num.z, block_dim.x, block_dim.y, block_dim.z, int(scan_mask));
+        }
+    }
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
