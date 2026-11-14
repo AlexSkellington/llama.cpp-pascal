@@ -126,6 +126,9 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+// Omit the host copy of MTP hidden rows for the next decode only.
+LLAMA_API void llama_skip_embeddings_nextn_once(struct llama_context * ctx);
+
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
