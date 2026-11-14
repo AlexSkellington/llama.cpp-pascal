@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1861,6 +1862,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // Every active sequence has drafted i tokens before this pass.
+            // The last pass needs its logits and retained KV, but no next
+            // draft consumes its hidden row.
+            static const bool skip_final_host_copy = [] {
+                const char * enabled = std::getenv("LLAMA_MTP_SKIP_FINAL_COPY");
+                return enabled && std::strcmp(enabled, "1") == 0;
+            }();
+            const bool skip_h = skip_final_host_copy && i + 1 == params.n_max;
+            if (skip_h) {
+                llama_skip_embeddings_nextn_once(ctx_dft);
+            }
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -1880,8 +1892,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
-
+                const float * h_row = skip_h ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
@@ -1918,6 +1929,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                GGML_ASSERT(h_row != nullptr);
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
