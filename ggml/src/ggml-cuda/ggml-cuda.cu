@@ -3175,12 +3175,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
-        if (ggml_cuda_is_view_or_noop(node)) {
-            continue;
-        }
-
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-        if (node->op == GGML_OP_MUL_MAT_ID) {
+        if (node->op == GGML_OP_MUL_MAT_ID && !ggml_is_empty(node)) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
