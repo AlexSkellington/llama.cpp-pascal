@@ -643,6 +643,11 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    // local patch 0059: disk tier for the prompt cache (survives restarts and router model switches)
+    std::string cache_disk_path;            // directory, empty = disabled
+    int32_t cache_disk_mib        = 0;      // budget for the whole directory (all models), 0 = auto (90% of its filesystem)
+    int32_t cache_disk_idle_s     = 20;     // save slot states after this many idle seconds
+    int32_t cache_disk_min_tokens = 2048;   // smaller prompts are neither saved nor looked up
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
     // llama-connect params

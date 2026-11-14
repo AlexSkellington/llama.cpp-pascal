@@ -33,6 +33,8 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <set>
+#include <unordered_set>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1753,6 +1755,14 @@ private:
             handle_sleeping_state(sleeping);
         });
 
+        // local patch 0059: disk tier for the prompt cache
+        pcd_init();
+        if (pcd_on) {
+            queue_tasks.on_idle([this](int64_t idle_ms) {
+                pcd_on_idle(idle_ms);
+            });
+        }
+
         metrics.init();
 
         if (params_base.cache_idle_slots) {
@@ -1973,6 +1983,11 @@ private:
         }
 
         if (ret) {
+            // local patch 0059: a much longer match on disk wins over the slot and the RAM cache
+            if (pcd_try_load(*ret, task)) {
+                update_cache = false;
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -3197,6 +3212,544 @@ private:
         }
         SLT_INF(slot, "restored the draft state (%.3f MiB) from '%s'\n", (float) n_read / 1024 / 1024, filepath.c_str());
         return n_read;
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // local patch 0059: disk tier for the prompt cache
+    // file: magic, version, fingerprint, serialized tokens, target state, draft state, speculative state,
+    //       context checkpoints, end magic. Only this code reads and writes these files.
+    // -----------------------------------------------------------------------------------------------------------
+    static constexpr uint32_t PCD_MAGIC     = 0x31444350; // "PCD1"
+    static constexpr uint32_t PCD_END       = 0x444e4550; // "PEND"
+    static constexpr uint32_t PCD_VERSION   = 1;
+    static constexpr size_t   PCD_MIN_GAIN  = 1024;       // tokens a file must win by before it replaces the slot / RAM match
+    static constexpr int64_t  PCD_FLUSH_MS  = 30000;      // exit flush budget (keep the router's stop-timeout above this)
+
+    struct pcd_entry {
+        std::string   path;
+        server_tokens tokens;
+        size_t        bytes  = 0;
+        int64_t       t_used = 0; // file mtime (ms on the filesystem clock), refreshed on every restore
+    };
+
+    bool                   pcd_on = false;
+    std::string            pcd_dir;
+    std::string            pcd_fp;
+    std::vector<pcd_entry> pcd_index;
+    std::unordered_set<uint64_t> pcd_done;                // hashes of token lists known to be on disk
+    std::vector<uint64_t>  pcd_slot_sig;                  // per slot: hash of the state last saved or checked
+    std::set<std::pair<const void *, size_t>> pcd_ram_seen; // RAM cache entries already saved or checked
+
+    static uint64_t pcd_hash(const std::vector<char> & packed) {
+        uint64_t h = 1469598103934665603ULL;
+        for (const char c : packed) {
+            h ^= (uint8_t) c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    static int64_t pcd_mtime_ms(const std::filesystem::path & p) {
+        std::error_code ec;
+        const auto t = std::filesystem::last_write_time(p, ec);
+        return ec ? 0 : (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
+    }
+
+    template <typename Buf>
+    static bool pcd_read_buf(std::ifstream & ifs, Buf & buf, size_t n_avail, size_t & n_read) {
+        return ckpt_read_buf(ifs, buf, n_avail, n_read);
+    }
+
+    void pcd_init() {
+        namespace fs = std::filesystem;
+        if (params_base.cache_disk_path.empty()) {
+            return;
+        }
+        std::string name = fs::path(params_base.model.path).filename().string();
+        for (auto & c : name) {
+            if (!isalnum((unsigned char) c) && c != '.' && c != '-' && c != '_') {
+                c = '_';
+            }
+        }
+        if (name.empty()) {
+            name = "model";
+        }
+        std::error_code ec;
+        pcd_dir = (fs::path(params_base.cache_disk_path) / name).string();
+        fs::create_directories(pcd_dir, ec);
+        if (ec) {
+            SRV_WRN("disk prompt cache disabled: cannot create '%s': %s\n", pcd_dir.c_str(), ec.message().c_str());
+            return;
+        }
+        pcd_fp = string_format("%s|%" PRIu64 "|%" PRIu64 "|%d|%d|%d|%d", name.c_str(),
+                (uint64_t) llama_model_size(model_tgt), (uint64_t) llama_model_n_params(model_tgt), (int) n_ctx_slot(),
+                (int) params_base.cache_type_k, (int) params_base.cache_type_v, ctx_dft ? 1 : 0);
+        pcd_slot_sig.assign(slots.size(), 0);
+
+        // interrupted writes (never renamed into place), in any model's subdirectory
+        const auto stale = fs::file_time_type::clock::now() - std::chrono::minutes(10);
+        for (const auto & dir : fs::directory_iterator(params_base.cache_disk_path, ec)) {
+            std::error_code ec2;
+            if (!dir.is_directory(ec2)) {
+                continue;
+            }
+            for (const auto & de : fs::directory_iterator(dir.path(), ec2)) {
+                std::error_code ec3;
+                if (de.path().filename().string().rfind(".tmp-", 0) == 0 && fs::last_write_time(de.path(), ec3) < stale) {
+                    fs::remove(de.path(), ec3);
+                }
+            }
+        }
+        size_t n_other = 0;
+        for (const auto & de : fs::directory_iterator(pcd_dir, ec)) {
+            const fs::path p  = de.path();
+            const std::string fn = p.filename().string();
+            if (fn.rfind("pc-", 0) != 0) {
+                continue;
+            }
+            pcd_entry e;
+            if (pcd_read_header(p.string(), e)) {
+                pcd_index.push_back(std::move(e));
+            } else {
+                n_other++;
+            }
+        }
+        pcd_on = true;
+        size_t total = 0;
+        for (const auto & e : pcd_index) {
+            total += e.bytes;
+        }
+        SRV_INF("disk prompt cache: '%s', %zu entries, %.1f MiB (other configs: %zu; budget %s, idle %d s, min %d tokens)\n",
+                pcd_dir.c_str(), pcd_index.size(), total / 1048576.0, n_other, pcd_budget_str().c_str(),
+                params_base.cache_disk_idle_s, params_base.cache_disk_min_tokens);
+        pcd_trim();
+    }
+
+    // reads the header and the tokens; false if the file is not ours or belongs to another configuration
+    bool pcd_read_header(const std::string & path, pcd_entry & e) const {
+        std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            return false;
+        }
+        const size_t file_size = (size_t) ifs.tellg();
+        ifs.seekg(0);
+        size_t   n_read  = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        std::string fp;
+        std::vector<char> packed_bytes;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != PCD_MAGIC ||
+            !ckpt_read(ifs, &version, sizeof(version), n_read) || version != PCD_VERSION ||
+            !pcd_read_buf(ifs, fp, file_size, n_read) || fp != pcd_fp ||
+            !pcd_read_buf(ifs, packed_bytes, file_size, n_read) || packed_bytes.size() % sizeof(llama_token) != 0) {
+            return false;
+        }
+        llama_tokens packed(packed_bytes.size() / sizeof(llama_token));
+        memcpy(packed.data(), packed_bytes.data(), packed_bytes.size());
+        try {
+            e.tokens = server_tokens::deserialize(packed, mctx != nullptr);
+        } catch (const std::exception &) {
+            return false;
+        }
+        e.path   = path;
+        e.bytes  = file_size;
+        e.t_used = pcd_mtime_ms(path);
+        return true;
+    }
+
+    // true if a file already holds these tokens (or a longer list starting with them)
+    bool pcd_contained(const server_tokens & tokens) const {
+        for (const auto & e : pcd_index) {
+            if (e.tokens.size() >= tokens.size() && e.tokens.get_common_prefix(tokens) == tokens.size()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void pcd_remove(size_t i) {
+        std::error_code ec;
+        std::filesystem::remove(pcd_index[i].path, ec);
+        pcd_index.erase(pcd_index.begin() + i);
+    }
+
+    // model-agnostic budget: one budget for the whole cache directory, shared by every model's subdirectory.
+    // --cache-disk-mib N, or 0 = auto = 90% of the filesystem / dataset it is on (a ZFS quota counts as its size);
+    // the filesystem also keeps >= 5% free. Least recently used files go first, whichever model they belong to
+    // (files of other configurations included, so stale ones age out by themselves). `extra` = bytes about to be written.
+    void pcd_trim(uintmax_t extra = 0) {
+        namespace fs = std::filesystem;
+        struct item { fs::path p; uintmax_t bytes; int64_t t; };
+        std::vector<item> all;
+        uintmax_t total = 0;
+        std::error_code ec;
+        for (const auto & dir : fs::directory_iterator(params_base.cache_disk_path, ec)) {
+            std::error_code ec2;
+            if (!dir.is_directory(ec2)) {
+                continue;
+            }
+            for (const auto & de : fs::directory_iterator(dir.path(), ec2)) {
+                if (de.path().filename().string().rfind("pc-", 0) != 0) {
+                    continue;
+                }
+                std::error_code ec3;
+                const uintmax_t b = fs::file_size(de.path(), ec3);
+                if (ec3) {
+                    continue;
+                }
+                all.push_back({de.path(), b, pcd_mtime_ms(de.path())});
+                total += b;
+            }
+        }
+        const fs::space_info si = fs::space(params_base.cache_disk_path, ec);
+        const bool      have_si = !ec && si.capacity > 0;
+        const uintmax_t budget  = params_base.cache_disk_mib > 0 ? (uintmax_t) params_base.cache_disk_mib * 1048576ull
+                                                                : (have_si ? si.capacity / 10 * 9 : 0);
+        const uintmax_t floor   = have_si ? si.capacity / 20 : 0;
+        uintmax_t       avail   = have_si ? si.available : UINTMAX_MAX;
+        std::sort(all.begin(), all.end(), [](const item & a, const item & b) { return a.t < b.t; });
+        for (const auto & it : all) {
+            const bool over_budget = budget > 0 && total + extra > budget;
+            const bool low_space   = have_si && avail < floor + extra;
+            if (!over_budget && !low_space) {
+                break;
+            }
+            SRV_INF("disk prompt cache: %s, removing least recently used '%s' (%.1f MiB)\n",
+                    over_budget ? "budget reached" : "filesystem low on space", it.p.string().c_str(), it.bytes / 1048576.0);
+            std::error_code ec4;
+            fs::remove(it.p, ec4);
+            total -= it.bytes;
+            avail += it.bytes;
+            for (size_t i = 0; i < pcd_index.size(); ++i) {
+                if (fs::path(pcd_index[i].path) == it.p) {
+                    pcd_index.erase(pcd_index.begin() + i);
+                    break;
+                }
+            }
+        }
+    }
+
+    // human-readable budget for the log
+    std::string pcd_budget_str() const {
+        if (params_base.cache_disk_mib > 0) {
+            return string_format("%d MiB (all models)", params_base.cache_disk_mib);
+        }
+        std::error_code ec;
+        const auto si = std::filesystem::space(params_base.cache_disk_path, ec);
+        return ec ? std::string("auto (filesystem size unknown)")
+                  : string_format("auto = %.1f GiB (90%% of %.1f GiB, all models)", si.capacity / 10 * 9 / 1073741824.0, si.capacity / 1073741824.0);
+    }
+
+    template <typename Main, typename Drft>
+    bool pcd_store(const std::vector<char> & packed, uint64_t h, const server_tokens & tokens,
+                   const Main & main, const Drft & drft, const std::vector<uint8_t> & spec_state,
+                   const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints, const char * what) {
+        namespace fs = std::filesystem;
+        const int64_t t_start = ggml_time_us();
+        char name[64];
+        snprintf(name, sizeof(name), "pc-%016" PRIx64 ".bin", h);
+        const std::string path = (fs::path(pcd_dir) / name).string();
+        const std::string tmp  = (fs::path(pcd_dir) / (std::string(".tmp-") + name)).string();
+        // make room first (least recently used, any model), so a save never fails on a full budget
+        uintmax_t est = packed.size() + main.size() + drft.size() + spec_state.size() + 4096;
+        for (const auto & ckpt : checkpoints) {
+            est += ckpt->data_tgt.size() + ckpt->data_dft.size() + ckpt->data_spec.size() + 64;
+        }
+        pcd_trim(est);
+        size_t n = 0;
+        {
+            std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                SRV_WRN("disk prompt cache: cannot write '%s'\n", tmp.c_str());
+                return false;
+            }
+            const uint32_t magic = PCD_MAGIC, version = PCD_VERSION, end = PCD_END;
+            ckpt_write(ofs, &magic, sizeof(magic), n);
+            ckpt_write(ofs, &version, sizeof(version), n);
+            ckpt_write_buf(ofs, pcd_fp, n);
+            ckpt_write_buf(ofs, packed, n);
+            ckpt_write_buf(ofs, main, n);
+            ckpt_write_buf(ofs, drft, n);
+            ckpt_write_buf(ofs, spec_state, n);
+            const uint32_t count = (uint32_t) checkpoints.size();
+            ckpt_write(ofs, &count, sizeof(count), n);
+            for (const auto & ckpt : checkpoints) {
+                const auto & cur = *ckpt;
+                ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n);
+                ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n);
+                ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n);
+                ckpt_write_buf(ofs, cur.data_tgt,  n);
+                ckpt_write_buf(ofs, cur.data_dft,  n);
+                ckpt_write_buf(ofs, cur.data_spec, n);
+            }
+            ckpt_write(ofs, &end, sizeof(end), n);
+            ofs.flush();
+            if (!ofs) {
+                std::error_code ec;
+                fs::remove(tmp, ec);
+                SRV_WRN("disk prompt cache: write of '%s' failed (disk full?)\n", tmp.c_str());
+                return false;
+            }
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(tmp, ec);
+            return false;
+        }
+        // older turns of the same conversation: their tokens are a prefix of this one
+        for (size_t i = 0; i < pcd_index.size();) {
+            if (pcd_index[i].path == path) {
+                pcd_index.erase(pcd_index.begin() + i); // replaced in place by the rename
+            } else if (pcd_index[i].tokens.size() <= tokens.size() &&
+                       pcd_index[i].tokens.get_common_prefix(tokens) == pcd_index[i].tokens.size()) {
+                pcd_remove(i);
+            } else {
+                ++i;
+            }
+        }
+        pcd_entry e;
+        e.path   = path;
+        e.tokens = tokens.clone();
+        e.bytes  = n;
+        e.t_used = pcd_mtime_ms(path);
+        pcd_index.push_back(std::move(e));
+        pcd_done.insert(h);
+        SRV_INF("disk prompt cache: saved %s, %zu tokens, %u checkpoint(s), %.1f MiB in %.0f ms -> %s\n",
+                what, tokens.size(), (unsigned) checkpoints.size(), n / 1048576.0, (ggml_time_us() - t_start) / 1000.0, name);
+        pcd_trim();
+        return true;
+    }
+
+    bool pcd_save_slot(server_slot & slot, const std::vector<char> & packed, uint64_t h) {
+        common_state_data main;
+        common_state_data drft;
+        main.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+        if (llama_state_seq_get_data_ext(ctx_tgt, main.data(), main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != main.size()) {
+            return false;
+        }
+        if (ctx_dft != nullptr) {
+            drft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+            if (llama_state_seq_get_data_ext(ctx_dft, drft.data(), drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != drft.size()) {
+                return false;
+            }
+        }
+        std::vector<uint8_t> spec_state;
+        common_speculative_get_state(spec.get(), slot.id, spec_state);
+        return pcd_store(packed, h, slot.prompt.tokens, main, drft, spec_state, slot.prompt.checkpoints, "slot");
+    }
+
+    // budget_ms < 0: no time budget
+    void pcd_save_dirty(int64_t budget_ms) {
+        const int64_t t_start = ggml_time_ms();
+        const size_t  n_min   = (size_t) std::max(1, params_base.cache_disk_min_tokens);
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.tokens.size() < n_min) {
+                continue;
+            }
+            std::vector<char> packed;
+            try {
+                packed = slot.prompt.tokens.serialize();
+            } catch (const std::exception &) {
+                continue;
+            }
+            const uint64_t h = pcd_hash(packed);
+            if (pcd_slot_sig[slot.id] == h) {
+                continue;
+            }
+            pcd_slot_sig[slot.id] = h;
+            if (pcd_done.count(h) || pcd_contained(slot.prompt.tokens)) {
+                pcd_done.insert(h);
+                continue;
+            }
+            pcd_save_slot(slot, packed, h);
+            if (budget_ms >= 0 && ggml_time_ms() - t_start > budget_ms) {
+                return;
+            }
+        }
+        if (!prompt_cache) {
+            return;
+        }
+        // RAM cache entries (chats that left their slot while the server was busy), newest first
+        for (auto it = prompt_cache->states.rbegin(); it != prompt_cache->states.rend(); ++it) {
+            const auto key = std::make_pair((const void *) &*it, it->prompt.tokens.size());
+            if (it->prompt.tokens.size() < n_min || pcd_ram_seen.count(key)) {
+                continue;
+            }
+            pcd_ram_seen.insert(key);
+            std::vector<char> packed;
+            try {
+                packed = it->prompt.tokens.serialize();
+            } catch (const std::exception &) {
+                continue;
+            }
+            const uint64_t h = pcd_hash(packed);
+            if (pcd_done.count(h) || pcd_contained(it->prompt.tokens) || it->data.main.empty()) {
+                pcd_done.insert(h);
+                continue;
+            }
+            pcd_store(packed, h, it->prompt.tokens, it->data.main, it->data.drft, std::vector<uint8_t>(),
+                      it->prompt.checkpoints, "ram entry");
+            if (budget_ms >= 0 && ggml_time_ms() - t_start > budget_ms) {
+                return;
+            }
+        }
+    }
+
+    void pcd_on_idle(int64_t idle_ms) {
+        if (!pcd_on || idle_ms < 1000LL * params_base.cache_disk_idle_s) {
+            return;
+        }
+        pcd_save_dirty(-1);
+    }
+
+    void pcd_flush() {
+        if (!pcd_on) {
+            return;
+        }
+        const int64_t t_start = ggml_time_ms();
+        pcd_save_dirty(PCD_FLUSH_MS);
+        SRV_INF("disk prompt cache: exit flush done in %" PRId64 " ms\n", ggml_time_ms() - t_start);
+    }
+
+    bool pcd_load(server_slot & slot, const pcd_entry & e) {
+        std::ifstream ifs(e.path, std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            return false;
+        }
+        const size_t file_size = (size_t) ifs.tellg();
+        ifs.seekg(0);
+        size_t   n_read  = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        std::string fp;
+        std::vector<char> packed_bytes;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != PCD_MAGIC ||
+            !ckpt_read(ifs, &version, sizeof(version), n_read) || version != PCD_VERSION ||
+            !pcd_read_buf(ifs, fp, file_size, n_read) || fp != pcd_fp ||
+            !pcd_read_buf(ifs, packed_bytes, file_size, n_read) || packed_bytes.size() % sizeof(llama_token) != 0) {
+            return false;
+        }
+        llama_tokens packed(packed_bytes.size() / sizeof(llama_token));
+        memcpy(packed.data(), packed_bytes.data(), packed_bytes.size());
+        server_tokens tokens;
+        try {
+            tokens = server_tokens::deserialize(packed, mctx != nullptr);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (tokens.size() > (size_t) slot.n_ctx || !tokens.validate(ctx_tgt)) {
+            return false;
+        }
+        {
+            common_state_data main;
+            if (!pcd_read_buf(ifs, main, file_size, n_read) ||
+                llama_state_seq_set_data_ext(ctx_tgt, main.data(), main.size(), slot.id, 0) != main.size()) {
+                return false;
+            }
+        }
+        {
+            common_state_data drft;
+            if (!pcd_read_buf(ifs, drft, file_size, n_read)) {
+                return false;
+            }
+            if (ctx_dft != nullptr) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+            }
+            if (!drft.empty() && (ctx_dft == nullptr ||
+                    llama_state_seq_set_data_ext(ctx_dft, drft.data(), drft.size(), slot.id, 0) != drft.size())) {
+                return false; // the draft must match the target (MTP drafts share the context), all or nothing
+            }
+        }
+        std::vector<uint8_t> spec_state;
+        uint32_t count = 0;
+        if (!pcd_read_buf(ifs, spec_state, file_size, n_read) || !ckpt_read(ifs, &count, sizeof(count), n_read)) {
+            return false;
+        }
+        std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
+        for (uint32_t i = 0; i < count; ++i) {
+            auto ckpt = std::make_shared<common_prompt_checkpoint>();
+            auto & cur = *ckpt;
+            cur.id_task = -1; // restored, not created by a task
+            if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
+                !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
+                !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
+                !pcd_read_buf(ifs, cur.data_tgt,  file_size, n_read) ||
+                !pcd_read_buf(ifs, cur.data_dft,  file_size, n_read) ||
+                !pcd_read_buf(ifs, cur.data_spec, file_size, n_read)) {
+                return false;
+            }
+            checkpoints.push_back(std::move(ckpt));
+            if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
+                checkpoints.pop_front();
+            }
+        }
+        uint32_t end = 0;
+        if (!ckpt_read(ifs, &end, sizeof(end), n_read) || end != PCD_END) {
+            return false;
+        }
+        if (!spec_state.empty()) {
+            common_speculative_set_state(spec.get(), slot.id, spec_state);
+        }
+        slot.prompt.tokens = std::move(tokens);
+        slot.prompt.checkpoints = std::move(checkpoints);
+        return true;
+    }
+
+    // true if the slot now holds a state restored from disk
+    bool pcd_try_load(server_slot & slot, const server_task & task) {
+        if (!pcd_on || pcd_index.empty() || slot.is_processing() || task.is_stateless() ||
+            task.tokens.size() < (size_t) std::max(1, params_base.cache_disk_min_tokens)) {
+            return false;
+        }
+        size_t have = slot.prompt.tokens.get_common_prefix(task.tokens);
+        if (prompt_cache) {
+            for (const auto & st : prompt_cache->states) {
+                const size_t l = st.prompt.tokens.get_common_prefix(task.tokens);
+                if (l >= 0.25f * st.prompt.tokens.size()) {
+                    have = std::max(have, l); // the RAM cache would take this one
+                }
+            }
+        }
+        int    best   = -1;
+        size_t best_l = 0;
+        for (size_t i = 0; i < pcd_index.size(); ++i) {
+            const auto & e = pcd_index[i];
+            if (e.tokens.size() > (size_t) slot.n_ctx) {
+                continue;
+            }
+            const size_t l = e.tokens.get_common_prefix(task.tokens);
+            if (l < 0.25f * e.tokens.size()) {
+                continue; // same rule as the RAM cache: do not restore a large state for a small part of it
+            }
+            if (l > best_l) {
+                best_l = l;
+                best   = (int) i;
+            }
+        }
+        if (best < 0 || best_l < have + PCD_MIN_GAIN) {
+            return false;
+        }
+        if (prompt_cache) {
+            slot.prompt_save(*prompt_cache); // keep what the slot holds
+            prompt_cache->update();
+        }
+        slot.prompt_clear();
+        const int64_t t_start = ggml_time_us();
+        const std::string path = pcd_index[best].path;
+        if (!pcd_load(slot, pcd_index[best])) {
+            SLT_WRN(slot, "disk prompt cache: restore from '%s' failed, file removed\n", path.c_str());
+            slot.prompt_clear();
+            pcd_remove(best);
+            return false;
+        }
+        std::error_code ec;
+        std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
+        pcd_index[best].t_used = pcd_mtime_ms(path);
+        pcd_slot_sig[slot.id] = 0;
+        SLT_INF(slot, "disk prompt cache: restored %zu tokens (prefix match %zu, slot/RAM had %zu) in %.0f ms from '%s'\n",
+                slot.prompt.tokens.size(), best_l, have, (ggml_time_us() - t_start) / 1000.0, path.c_str());
+        return true;
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -5527,6 +6080,8 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // local patch 0059: the model is still loaded here (clean_up frees it); router stop / SIGTERM end up here
+    impl->pcd_flush();
 }
 
 void server_context::terminate() {
