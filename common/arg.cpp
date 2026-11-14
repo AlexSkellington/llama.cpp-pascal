@@ -1707,6 +1707,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_idle_slots = value;
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    // local patch 0059: disk tier for the prompt cache
+    add_opt(common_arg(
+        {"--cache-disk-path"}, "PATH",
+        "directory for the on-disk prompt cache (one subdirectory per model file): slot states are saved when the server "
+        "is idle and on exit, and restored when a new prompt matches a saved one much better than the RAM cache (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (!fs_is_directory(value)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-mib"}, "N",
+        string_format("size budget in MiB of the whole on-disk prompt cache directory, shared by every model; least recently used files "
+                      "(of any model) are removed first; 0 = auto: 90%% of the filesystem or dataset it is on, which also keeps 5%% free (default: %d)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-idle"}, "SECONDS",
+        string_format("save slot states to the on-disk prompt cache after this many idle seconds (default: %d)", params.cache_disk_idle_s),
+        [](common_params & params, int value) {
+            params.cache_disk_idle_s = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_IDLE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-min-tokens"}, "N",
+        string_format("prompts shorter than this are neither saved to nor looked up in the on-disk prompt cache (default: %d)", params.cache_disk_min_tokens),
+        [](common_params & params, int value) {
+            params.cache_disk_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},

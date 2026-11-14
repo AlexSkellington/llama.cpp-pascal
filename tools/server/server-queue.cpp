@@ -357,6 +357,12 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+                // local patch 0059: idle hook (disk prompt cache), run without the lock
+                if (callback_idle) {
+                    const int64_t idle_ms = ggml_time_ms() - time_last_task;
+                    lock.unlock();
+                    callback_idle(idle_ms);
+                }
                 // otherwise, loop again to check sleeping condition
             }
         }

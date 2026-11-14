@@ -45,6 +45,7 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    std::function<void(int64_t)>              callback_idle; // local patch 0059
 
 public:
     ~server_queue() { worker_stop(); }
@@ -134,6 +135,12 @@ public:
     // note: caller will hold mutex_tasks while calling the callbacks
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
+    }
+
+    // local patch 0059: called on the start_loop() thread, without the queue lock, about once a second while there is
+    // no task; the argument is the time since the last task in ms
+    void on_idle(std::function<void(int64_t)> callback) {
+        callback_idle = std::move(callback);
     }
 
 private:
