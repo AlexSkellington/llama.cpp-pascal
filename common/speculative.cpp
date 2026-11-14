@@ -1705,6 +1705,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const float * h_tgt = nullptr;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1715,7 +1717,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1787,9 +1789,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = h_rows;
             verify_h[seq_id].resize((size_t) h_rows * n_embd);
 
-            for (int32_t i = 0; i < h_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            if (h_tgt) {
+                // The catch-up decode runs on ctx_dft. The synchronized, unmasked target rows are still contiguous.
+                std::memcpy(verify_h[seq_id].data(), h_tgt + (size_t) h_offset * n_embd, (size_t) h_rows * row_bytes);
+            } else {
+                for (int32_t i = 0; i < h_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
             }
 
             std::memcpy(pending_h[seq_id].data(),
