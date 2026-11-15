@@ -113,10 +113,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_dense(ggml_type 
 
 // local patch 0038 (q4k): MoE-kernel switch -- 128-bit loads for Q4_K only.
 static constexpr __host__ __device__ int get_vdr_mmvq_moe(ggml_type type) {
-    return type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_W16 : get_vdr_mmvq(type);
+    return type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_W16 : type == GGML_TYPE_Q5_K ? VDR_Q5_K_Q8_1_MMVQ_W16 /* 0061 */ : get_vdr_mmvq(type);
 }
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_moe(ggml_type type) {
-    return type == GGML_TYPE_Q4_K ? vec_dot_q4_K_q8_1_w16 : get_vec_dot_q_cuda(type);
+    return type == GGML_TYPE_Q4_K ? vec_dot_q4_K_q8_1_w16 : type == GGML_TYPE_Q5_K ? vec_dot_q5_K_q8_1_w16 /* local patch 0061 */ : get_vec_dot_q_cuda(type);
 }
 
 enum mmvq_parameter_table_id {
@@ -174,29 +174,15 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
 // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
+    // local patch 0062: measured on sm_61 (P5000, moebench 2026-11-14); see apply0062.py
     switch (type) {
-        case GGML_TYPE_IQ1_S:   return 6;
-        case GGML_TYPE_IQ1_M:   return 6;
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 5;
-        case GGML_TYPE_IQ2_XXS: return 5;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 5;
-        case GGML_TYPE_MXFP4:   return 4;
-        case GGML_TYPE_NVFP4:   return 4;
-        case GGML_TYPE_Q2_K:    return 4;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_0:    return 6;
-        case GGML_TYPE_Q4_1:    return 6;
-        case GGML_TYPE_Q4_K:    return 5;
-        case GGML_TYPE_Q5_0:    return 6;
-        case GGML_TYPE_Q5_1:    return 6;
-        case GGML_TYPE_Q5_K:    return 5;
-        case GGML_TYPE_Q6_K:    return 4;
-        case GGML_TYPE_Q8_0:    return 4;
-        default:                return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q8_0:    return 8;
+        case GGML_TYPE_Q6_K:    return 14;
+        case GGML_TYPE_NVFP4:   return 4;   // not measured: upstream value
+        case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ3_XXS:
+                                return 8;   // not measured: MMVQ_MAX_BATCH_SIZE
+        default:                return MMVQ_MOE_MAX_BATCH_SIZE;
     }
 }
 
@@ -1198,7 +1184,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= (ids ? MMVQ_MOE_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE)); // 0062
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1560,7 +1546,7 @@ static void lp0018_mul_mat_vec_q_impl(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MOE_MAX_BATCH_SIZE); // 0062
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
