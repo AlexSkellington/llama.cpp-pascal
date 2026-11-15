@@ -210,8 +210,22 @@ struct ggml_cuda_mmq_config {
 // The MMQ kernels only compare prec_src1 against GGML_PREC_Q4, so it behaves exactly like Q8; it selects launch bounds.
 #define GGML_PREC_Q8_LPMOE ((ggml_prec) 31)
 
+#ifndef LP70_IQ4_NT
+#define LP70_IQ4_NT 128
+#endif
+#ifndef LP70_IQ4_OCC
+#define LP70_IQ4_OCC 3
+#endif
+#ifndef LP70_IQ4_I
+#define LP70_IQ4_I 64
+#endif
+#ifndef LP70_IQ4_JMAX
+#define LP70_IQ4_JMAX 32
+#endif
 static constexpr __host__ __device__ ggml_cuda_mmq_config lp0068_moe_config(const ggml_cuda_mmq_config c, const ggml_prec prec_src1) {
-    return prec_src1 == GGML_PREC_Q8_LPMOE && c.J <= 32 &&
+    return prec_src1 == GGML_PREC_Q8_LPMOE && c.type == GGML_TYPE_IQ4_XS ? (c.J <= LP70_IQ4_JMAX ? // local patch 0070
+        ggml_cuda_mmq_config(c.type, LP70_IQ4_NT, LP70_IQ4_OCC, LP70_IQ4_I, c.J, c.sram_layout, c.K_vram, c.stream_k, c.fallback) : c) :
+           prec_src1 == GGML_PREC_Q8_LPMOE && c.J <= 32 &&
            (c.type == GGML_TYPE_Q4_K || c.type == GGML_TYPE_Q5_K || c.type == GGML_TYPE_Q6_K) ?
         ggml_cuda_mmq_config(c.type, 128, c.type == GGML_TYPE_Q5_K ? 4 : 3, c.I, c.J, c.sram_layout, c.K_vram, c.stream_k, c.fallback) : c;
 }
@@ -1672,6 +1686,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
 extern DECL_MMQ_CASE_LPMOE(GGML_TYPE_Q4_K); // local patch 0068
 extern DECL_MMQ_CASE_LPMOE(GGML_TYPE_Q5_K); // local patch 0068
 extern DECL_MMQ_CASE_LPMOE(GGML_TYPE_Q6_K); // local patch 0068
+extern DECL_MMQ_CASE_LPMOE(GGML_TYPE_IQ4_XS); // local patch 0070
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
