@@ -1130,6 +1130,11 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // local patch 0066: exact top-k candidate list of output i (every token with logit >= the k-th largest, in id
+    // order), computed on the GPU under tensor split. Returns the count, or -1 if unavailable (use llama_get_logits_ith).
+    LLAMA_API int32_t llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, int32_t k,
+                                                const int32_t ** ids, const float ** logits);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

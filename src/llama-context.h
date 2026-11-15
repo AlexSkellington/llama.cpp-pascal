@@ -349,6 +349,26 @@ private:
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
+    // local patch 0066: GPU top-K candidates + lazy full-logits fetch (tensor split)
+    struct lp66_state {
+        bool pending = false;                     // full rows of the last decode not copied yet
+        ggml_backend_t be = nullptr;              // meta backend that holds t
+        ggml_tensor * t = nullptr;                // logits tensor of the last decode
+        int64_t n_out = 0;
+        std::vector<int64_t> phys;                // logical row -> row in t
+        std::vector<std::vector<int32_t>> ids;    // per logical row, merged, logit-descending
+        std::vector<std::vector<float>> vals;
+        std::vector<std::vector<float>> dev_min;  // per row: per device smallest returned logit (+inf if its list was complete)
+        std::vector<uint8_t> full;                // per row: full logits materialized
+        std::vector<ggml_gallocr_t> galloc;       // per device mini-graph allocators
+        std::vector<int32_t> out_ids; std::vector<float> out_vals;  // last getter result
+    } lp66;
+    bool lp66_compute(ggml_backend_t be, ggml_tensor * t, int64_t n_out);
+    void lp66_materialize();
+public:
+    int32_t lp66_topk_ith(int32_t i, int32_t k, const int32_t ** ids, const float ** vals);
+private:
+
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};

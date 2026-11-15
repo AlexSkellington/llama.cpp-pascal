@@ -2634,6 +2634,14 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     return backend_ctx->backend_configs.size();
 }
 
+// local patch 0066
+struct ggml_tensor * ggml_backend_meta_tensor_part(const struct ggml_tensor * tensor, size_t index) {
+    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
+}
+struct ggml_backend_meta_split_state ggml_backend_meta_tensor_split_state(const struct ggml_tensor * tensor) {
+    return ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+}
+
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
