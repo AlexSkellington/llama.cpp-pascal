@@ -178,6 +178,25 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
+            // local patch 0066: under 0005's exact prefilter conditions, take the GPU top-k candidates (same set, same
+            // id order, same values as the CPU prefilter would build) and skip the full-vocab logits entirely
+            {
+                const int32_t k66 = params.top_k;
+                const char * first66 = llama_sampler_chain_n(chain) > 0 ? llama_sampler_name(llama_sampler_chain_get(chain, 0)) : "";
+                if (prefilter_ok && params.mirostat == 0 && params.n_probs == 0 && k66 > 0 && k66 < n_vocab &&
+                        strncmp(first66, "top-k", 5) == 0) {
+                    const int32_t * ids66 = nullptr; const float * lg66 = nullptr;
+                    const int32_t n66 = llama_get_logits_topk_ith(ctx, idx, k66, &ids66, &lg66);
+                    if (n66 >= k66) {
+                        cur.resize(n66);
+                        for (int32_t i = 0; i < n66; i++) {
+                            cur[i] = llama_token_data{ids66[i], lg66[i], 0.0f};
+                        }
+                        cur_p = { cur.data(), cur.size(), -1, false };
+                        return;
+                    }
+                }
+            }
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             // local patch 0005 (top-k prefilter): when the chain starts with top-k and nothing runs on the full vocab before it

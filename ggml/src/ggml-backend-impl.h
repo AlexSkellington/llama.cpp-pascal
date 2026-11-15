@@ -112,6 +112,9 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // local patch 0066: per-device part of a meta tensor and its split state
+    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_part(const struct ggml_tensor * tensor, size_t index);
+    GGML_API struct ggml_backend_meta_split_state ggml_backend_meta_tensor_split_state(const struct ggml_tensor * tensor);
 
     //
     // Backend (stream)

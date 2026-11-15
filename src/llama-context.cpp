@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h" // local patch 0066
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -15,6 +16,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic> // local patch 0066
 #include <unordered_set>
 #include <cinttypes>
 #include <cmath>
@@ -1137,8 +1139,168 @@ static void lp45_get_logits(ggml_backend_t be, ggml_tensor * t, float * dst, int
 }
 
 
+
+// ---- local patch 0066 ---------------------------------------------------------------------------------------------
+extern "C" {
+    bool           ggml_backend_is_meta(ggml_backend_t backend);
+    size_t         ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+    ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    struct ggml_tensor * ggml_backend_meta_tensor_part(const struct ggml_tensor * tensor, size_t index);
+    struct ggml_backend_meta_split_state ggml_backend_meta_tensor_split_state(const struct ggml_tensor * tensor);
+}
+
+static bool lp66_enabled() {
+    static const bool on = [] { const char * e = getenv("LLAMA_LP66"); return !(e && atoi(e) == 0); }();
+    return on;
+}
+
+static constexpr int LP66_K = 64;
+
+bool llama_context::lp66_compute(ggml_backend_t be, ggml_tensor * t, int64_t n_out) {
+    if (!be || !ggml_backend_is_meta(be) || t->type != GGML_TYPE_F32 || t->ne[2] != 1 || t->ne[3] != 1) {
+        return false;
+    }
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_tensor_split_state(t);
+    const size_t n_dev = ggml_backend_meta_n_backends(be);
+    if (ss.axis != GGML_BACKEND_SPLIT_AXIS_0 || ss.n_segments != 1 || ss.nr[0] != 1 || n_dev < 1 || n_dev > GGML_BACKEND_META_MAX_DEVICES) {
+        return false;
+    }
+    if (lp66.galloc.size() != n_dev) {
+        for (auto g : lp66.galloc) { ggml_gallocr_free(g); }
+        lp66.galloc.assign(n_dev, nullptr);
+    }
+    struct dev_out { std::vector<int32_t> idx; std::vector<float> val; int64_t off = 0; int k = 0; ggml_context * ctx = nullptr;
+                     ggml_tensor * ti = nullptr; ggml_tensor * tv = nullptr; ggml_backend_t b = nullptr; };
+    std::vector<dev_out> d(n_dev);
+    int64_t off = 0;
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_tensor * part = ggml_backend_meta_tensor_part(t, j);
+        const int64_t nv = ss.ne[j];
+        d[j].off = off; off += nv;
+        if (!part || part->ne[0] != nv || part->ne[1] < n_out || !ggml_is_contiguous(part)) {
+            for (auto & x : d) { if (x.ctx) { ggml_free(x.ctx); } }
+            return false;
+        }
+        d[j].k = (int) std::min<int64_t>(LP66_K, nv);
+        d[j].b = ggml_backend_meta_simple_backend(be, j);
+        ggml_init_params ip = { 8*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true };
+        d[j].ctx = ggml_init(ip);
+        // a leaf on the part's memory: the part is a node of the model graph, and building from it would walk the whole graph
+        if (part->nb[1] != (size_t) nv*sizeof(float) || part->data == nullptr) {
+            for (auto & x : d) { if (x.ctx) { ggml_free(x.ctx); } }
+            return false;
+        }
+        ggml_tensor * a = ggml_new_tensor_2d(d[j].ctx, GGML_TYPE_F32, nv, n_out);
+        a->data = part->data; a->buffer = part->buffer;
+        d[j].ti = ggml_top_k(d[j].ctx, a, d[j].k);
+        d[j].tv = ggml_get_rows(d[j].ctx, ggml_reshape_3d(d[j].ctx, a, 1, nv, n_out), d[j].ti);
+        ggml_cgraph * gf = ggml_new_graph_custom(d[j].ctx, 16, false);
+        ggml_build_forward_expand(gf, d[j].tv);
+        if (!lp66.galloc[j]) {
+            lp66.galloc[j] = ggml_gallocr_new(ggml_backend_get_default_buffer_type(d[j].b));
+        }
+        if (!ggml_gallocr_alloc_graph(lp66.galloc[j], gf) || ggml_backend_graph_compute_async(d[j].b, gf) != GGML_STATUS_SUCCESS) {
+            for (auto & x : d) { if (x.ctx) { ggml_free(x.ctx); } }
+            return false;
+        }
+    }
+    GGML_ASSERT(off == t->ne[0]);
+    for (size_t j = 0; j < n_dev; j++) {
+        d[j].idx.resize((size_t) d[j].k * n_out);
+        d[j].val.resize((size_t) d[j].k * n_out);
+        ggml_backend_tensor_get_async(d[j].b, d[j].ti, d[j].idx.data(), 0, d[j].idx.size()*sizeof(int32_t));
+        ggml_backend_tensor_get_async(d[j].b, d[j].tv, d[j].val.data(), 0, d[j].val.size()*sizeof(float));
+    }
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_synchronize(d[j].b);
+        ggml_free(d[j].ctx);
+    }
+    lp66.ids.assign(n_out, {}); lp66.vals.assign(n_out, {}); lp66.dev_min.assign(n_out, {});
+    std::vector<std::pair<float, int32_t>> m;
+    for (int64_t r = 0; r < n_out; r++) {
+        m.clear();
+        lp66.dev_min[r].assign(n_dev, INFINITY);
+        for (size_t j = 0; j < n_dev; j++) {
+            float mn = INFINITY;
+            for (int q = 0; q < d[j].k; q++) {
+                const float v = d[j].val[(size_t) r*d[j].k + q];
+                m.emplace_back(v, (int32_t) (d[j].idx[(size_t) r*d[j].k + q] + d[j].off));
+                mn = std::min(mn, v);
+            }
+            if (d[j].k < ss.ne[j]) {
+                lp66.dev_min[r][j] = mn;   // this card's list is truncated: tokens below it may be missing
+            }
+        }
+        std::sort(m.begin(), m.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+        lp66.ids[r].resize(m.size()); lp66.vals[r].resize(m.size());
+        for (size_t q = 0; q < m.size(); q++) { lp66.vals[r][q] = m[q].first; lp66.ids[r][q] = m[q].second; }
+    }
+    lp66.phys.resize(n_out);
+    for (int64_t r = 0; r < n_out; r++) { lp66.phys[r] = r; }
+    lp66.full.assign(n_out, 0);
+    lp66.be = be; lp66.t = t; lp66.n_out = n_out; lp66.pending = true;
+    return true;
+}
+
+void llama_context::lp66_materialize() {
+    if (!lp66.pending) {
+        return;
+    }
+    lp66.pending = false;
+    const int64_t n_vocab = model.vocab.n_tokens();
+    for (int64_t r = 0; r < lp66.n_out; r++) {
+        ggml_backend_tensor_get(lp66.t, logits.data + r*n_vocab, (size_t) lp66.phys[r]*lp66.t->nb[1], (size_t) n_vocab*sizeof(float));
+        lp66.full[r] = 1;
+    }
+}
+
+int32_t llama_context::lp66_topk_ith(int32_t i, int32_t k, const int32_t ** ids, const float ** vals) {
+    output_reorder();
+    if (!lp66.pending || k <= 0) {
+        return -1;
+    }
+    int64_t r;
+    try { r = output_resolve_row(i); } catch (...) { return -1; }
+    if (r < 0 || r >= lp66.n_out || lp66.full[r] || (size_t) k > lp66.vals[r].size()) {
+        return -1;
+    }
+    const float thr = lp66.vals[r][k - 1];
+    for (float mn : lp66.dev_min[r]) {
+        if (mn >= thr) {
+            return -1;     // a truncated card list reaches the threshold: tokens >= thr could be missing
+        }
+    }
+    lp66.out_ids.clear(); lp66.out_vals.clear();
+    std::vector<std::pair<int32_t, float>> sel;
+    for (size_t q = 0; q < lp66.vals[r].size() && lp66.vals[r][q] >= thr; q++) {
+        sel.emplace_back(lp66.ids[r][q], lp66.vals[r][q]);
+    }
+    std::sort(sel.begin(), sel.end());     // id order, like the CPU prefilter
+    for (const auto & s : sel) { lp66.out_ids.push_back(s.first); lp66.out_vals.push_back(s.second); }
+    static const bool check = [] { const char * e = getenv("LLAMA_LP66_CHECK"); return e && atoi(e) != 0; }();
+    if (check) {   // proof mode: rebuild the CPU prefilter list from the full row and compare
+        const int64_t n_vocab = model.vocab.n_tokens();
+        std::vector<float> row(n_vocab);
+        ggml_backend_tensor_get(lp66.t, row.data(), (size_t) lp66.phys[r]*lp66.t->nb[1], (size_t) n_vocab*sizeof(float));
+        std::vector<float> s(row); std::nth_element(s.begin(), s.begin() + (k - 1), s.end(), std::greater<float>());
+        const float thr_cpu = s[k - 1];
+        std::vector<int32_t> want;
+        for (int32_t id = 0; id < (int32_t) n_vocab; id++) { if (row[id] >= thr_cpu) { want.push_back(id); } }
+        bool same = want.size() == lp66.out_ids.size() && thr_cpu == thr;
+        for (size_t q = 0; same && q < want.size(); q++) { same = want[q] == lp66.out_ids[q] && row[want[q]] == lp66.out_vals[q]; }
+        static std::atomic<uint64_t> n_ok{0}, n_bad{0};
+        if (same) { n_ok++; } else { n_bad++; LLAMA_LOG_WARN("LP66 CHECK MISMATCH row %lld k %d: cpu %zu ids thr %g, gpu %zu ids thr %g\n",
+                    (long long) r, k, want.size(), thr_cpu, lp66.out_ids.size(), thr); }
+        if (((n_ok + n_bad) & 255) == 0) { LLAMA_LOG_WARN("LP66 CHECK %llu ok, %llu mismatches\n",
+                    (unsigned long long) n_ok.load(), (unsigned long long) n_bad.load()); }
+    }
+    *ids = lp66.out_ids.data(); *vals = lp66.out_vals.data();
+    return (int32_t) sel.size();
+}
+
 float * llama_context::get_logits() {
     output_reorder();
+    lp66_materialize(); // local patch 0066
 
     return logits.data;
 }
@@ -1174,6 +1336,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
+    lp66_materialize(); // local patch 0066
 
     try {
         if (logits.data == nullptr) {
@@ -2183,6 +2346,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    lp66.pending = false; // local patch 0066: nobody asked for the previous full logits
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2466,7 +2630,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                lp45_get_logits(backend_res, t_logits, logits_out, n_outputs, n_vocab, model.mtp_draft_ids);
+                // local patch 0066: GPU top-K candidates now, full rows only if someone asks
+                const bool lp66_try = lp66_enabled() && n_outputs_prev == 0 && (uint32_t) n_outputs == n_outputs_all &&
+                                      t_logits->ne[0] == n_vocab && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+                if (!(lp66_try && lp66_compute(backend_res, t_logits, n_outputs))) {
+                    lp45_get_logits(backend_res, t_logits, logits_out, n_outputs, n_vocab, model.mtp_draft_ids);
+                }
             }
         }
 
@@ -2871,6 +3040,11 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
+        }
+        if (lp66.pending && (int64_t) std::max(i0, i1) < lp66.n_out) { // local patch 0066
+            std::swap(lp66.phys[i0], lp66.phys[i1]); std::swap(lp66.ids[i0], lp66.ids[i1]);
+            std::swap(lp66.vals[i0], lp66.vals[i1]); std::swap(lp66.dev_min[i0], lp66.dev_min[i1]);
+            std::swap(lp66.full[i0], lp66.full[i1]);
         }
 
         if (embd.size > 0) {
@@ -4733,6 +4907,10 @@ float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_logits();
+}
+
+int32_t llama_get_logits_topk_ith(llama_context * ctx, int32_t i, int32_t k, const int32_t ** ids, const float ** logits) {
+    return ctx->lp66_topk_ith(i, k, ids, logits); // local patch 0066
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
