@@ -332,6 +332,16 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // local patch 0063: measured on sm_61 (P5000, 2026-11-14); see apply0063.py
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 610 && cc < GGML_CUDA_CC_VOLTA) {
+        switch (type) {
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q2_K:
+                return ne11 <= 6;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
