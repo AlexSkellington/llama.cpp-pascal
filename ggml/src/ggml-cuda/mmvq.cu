@@ -1681,7 +1681,7 @@ void lp0018_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor * c
     const int64_t padded = GGML_PAD(x->ne[0], MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> q(ctx.pool(), x->ne[3]*x->ne[2]*x->ne[1]*padded*sizeof(block_q8_1)/QK8_1);
     const size_t ts = ggml_type_size(x->type);
-    quantize_row_q8_1_cuda((const float *) x->data, nullptr, q.get(), nodes[0]->src[0]->type,
+    quantize_row_q8_1_cuda((const float *) x->data, q.get(),
             x->ne[0], x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts, padded, x->ne[1], x->ne[2], x->ne[3], ctx.stream());
     for (int k = 0; k < n; k++) {
         GGML_ASSERT(nodes[k]->src[1] == x);

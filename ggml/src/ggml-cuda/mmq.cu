@@ -447,7 +447,7 @@ bool lab_mmq_prefill_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, 
                 !y->buffer || ggml_backend_buffer_get_type(y->buffer) != buft || !(y->flags & GGML_TENSOR_FLAG_COMPUTE) ||
                 y->type != GGML_TYPE_F32 || y->src[2] || !ggml_is_quantized(w->type) ||
                 w->ne[0] != x->ne[0] || ggml_get_op_params_i32(y, 1) != GGML_HINT_NONE ||
-                ggml_cuda_should_use_mmvf(w->type, cc, warp, w->ne, w->nb, x->ne[1]) ||
+                ggml_cuda_should_use_mmvf(w, cc, warp, x->ne[1]) ||
                 ggml_cuda_should_use_mmf(w->type, cc, warp, w->ne, w->nb, x->ne[1], false) ||
                 ggml_cuda_should_use_mmvq(w->type, cc, x->ne[1]) ||
                 !ggml_cuda_should_use_mmq(w->type, cc, x->ne[1], 0) ||
