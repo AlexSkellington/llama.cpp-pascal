@@ -3433,7 +3433,7 @@ mtmd_video_config mtmd_get_video_config_req(const mtmd_context * ctx,
 }
 
 void mtmd_get_image_pixel_limits(const mtmd_context * ctx, int * min_pixels, int * max_pixels) {
-    const clip_hparams * hp = ctx && ctx->ctx_v ? clip_get_hparams(ctx->ctx_v) : nullptr;
+    const mtmd_hparams * hp = ctx && ctx->ctx_v ? &ctx->ctx_v->model.hparams : nullptr; // 0055 (upstream: clip_hparams -> mtmd_hparams)
     *min_pixels = hp ? hp->image_min_pixels : 0;
     *max_pixels = hp ? hp->image_max_pixels : 0;
 }
@@ -3442,7 +3442,7 @@ void mtmd_set_image_pixel_limits(mtmd_context * ctx, int min_pixels, int max_pix
     if (!ctx || !ctx->ctx_v) {
         return;
     }
-    auto * hp = const_cast<clip_hparams *>(clip_get_hparams(ctx->ctx_v));
+    auto * hp = const_cast<mtmd_hparams *>(&ctx->ctx_v->model.hparams); // 0055 (as before: const_cast)
     hp->image_min_pixels = min_pixels;
     hp->image_max_pixels = max_pixels;
 }
