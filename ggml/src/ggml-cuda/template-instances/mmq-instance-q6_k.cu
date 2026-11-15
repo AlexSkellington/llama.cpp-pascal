@@ -3,3 +3,4 @@
 #include "../mmq.cuh"
 
 DECL_MMQ_CASE(GGML_TYPE_Q6_K);
+DECL_MMQ_CASE_LPMOE(GGML_TYPE_Q6_K); // local patch 0068

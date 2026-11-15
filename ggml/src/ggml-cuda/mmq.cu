@@ -40,12 +40,24 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_K:
+            if (prec_src1 == GGML_PREC_Q8_LPMOE) { // local patch 0068
+                mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8_LPMOE>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_K:
+            if (prec_src1 == GGML_PREC_Q8_LPMOE) { // local patch 0068
+                mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8_LPMOE>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_K:
+            if (prec_src1 == GGML_PREC_Q8_LPMOE) { // local patch 0068
+                mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8_LPMOE>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
@@ -252,7 +264,16 @@ static bool lab_mmq_mul_mat_q(
     const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
 
     // With fusion dst is the GLU output or the scale node, not a MUL_MAT; the src1 precision requested by the fused MUL_MATs is in the fusion args.
-    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0->type, fusion ? fusion->prec_src1 : ggml_prec_get_src(dst, 1), cc);
+    ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0->type, fusion ? fusion->prec_src1 : ggml_prec_get_src(dst, 1), cc);
+    // local patch 0068: MoE K-quant tiles on Pascal DP4A take the 128-thread launch bounds (GGML_CUDA_LP0068=0 disables).
+    {
+        static const bool lp0068 = [] { const char * e = getenv("GGML_CUDA_LP0068"); return !(e && e[0] == '0'); }();
+        if (lp0068 && ids && prec_src1 == GGML_PREC_Q8 && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_VOLTA &&
+                (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K)) {
+            prec_src1 = GGML_PREC_Q8_LPMOE;
+        }
+    }
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
