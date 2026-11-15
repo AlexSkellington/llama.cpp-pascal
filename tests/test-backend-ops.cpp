@@ -13278,6 +13278,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // KV-head counts that do not divide the device count
+    // local patch 0067: Qwen3.8 shape -- head 256, GQA 6, q8_0 K/V, decode / MTP verify, long KV (DP4A fold route)
+    for (int nb : { 1, 2, 3, }) {
+        for (int kv : { 4096, 8192, 8192 + 77, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
     for (int hs : { 128, 256, 512, }) {
         for (int nh : { 1, 2, 6, }) {
             for (int nr2 : { 4, 8, }) {

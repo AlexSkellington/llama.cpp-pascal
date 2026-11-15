@@ -1280,7 +1280,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
 
 
     // LP_DP4A_PREFILL: load packed Q8 keys cooperatively, transposed in shared memory.
-    static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1 && !fold_gqa, "prototype layout");
+    static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1, "prototype layout"); // 0067: fold_gqa allowed
     constexpr int words = DKQ/4;
     constexpr int pitch = nbatch_fa+1;
     int * const packed_K = (int *) KV_tmp;
@@ -1698,15 +1698,17 @@ static __global__ void lpdp4a_tile(
     ggml_cuda_pdl_sync();
 
 
-    static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1 && !fold_gqa, "prototype layout");
+    static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1, "prototype layout"); // 0067: fold_gqa allowed
     // A warp owns cpw query columns. Each 32-element block has its own F32 scale.
     // No FP16 query scale or probability/value accumulation is introduced.
 #pragma unroll
     for (int col=0; col<cpw; ++col) {
-        const int jc=col+threadIdx.y*cpw, j=jc/ncols2, head=jc%ncols2;
+        constexpr int ncols2_q = fold_gqa ? 6 : ncols2; // local patch 0067: lp0024 fold mapping
+        const int jc=col+threadIdx.y*cpw, j=jc/ncols2_q, head=jc%ncols2_q;
+        const bool valid_q = !fold_gqa || (jc < ncols_valid && col_Q_0 + j < int(ne01.z));
 #pragma unroll
         for (int block=0; block<DKQ/32; ++block) {
-            const float val=Q_f[head*(nb02/sizeof(float))+fastmodulo(col_Q_0+j,ne01)*(nb01/sizeof(float))+block*32+threadIdx.x]*scale;
+            const float val=valid_q ? Q_f[head*(nb02/sizeof(float))+fastmodulo(col_Q_0+j,ne01)*(nb01/sizeof(float))+block*32+threadIdx.x]*scale : 0.0f;
             const float maxval=warp_reduce_max<32>(fabsf(val));
             const float d=maxval/127.0f;
             const int qi=d>0.0f ? max(-127,min(127,int(roundf(val/d)))) : 0;
@@ -2198,6 +2200,22 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (lp0024_eligible(dst, cc)) {
+            // local patch 0067: long-context GQA-6 decode on the DP4A tile kernel (fold layout, 32 columns)
+            static const bool on67 = [] { const char * e = getenv("GGML_CUDA_LP0067"); return !(e && atoi(e) == 0); }();
+            const ggml_tensor * V67 = dst->src[2];
+            const bool alias67 = V67->view_src && (V67->view_src == K || (V67->view_src == K->view_src && V67->view_offs == K->view_offs));
+            const long long gate67 = Q->ne[1] >= 4 ? 2048LL : 4096LL;   // 0031's decode gate
+            if (on67 && cc == 610 && Q->ne[1] <= 5 && K->ne[1] >= gate67 && K->type == GGML_TYPE_Q8_0 && V67->type == GGML_TYPE_Q8_0 &&
+                    K->nb[1] % sizeof(block_q8_0) == 0 && V67->nb[1] % sizeof(block_q8_0) == 0 && !alias67 && max_bias == 0.0f &&
+                    !dst->src[4]) {
+                static thread_local unsigned logged67 = 0;
+                if (getenv("GGML_CUDA_LP0027_TRACE") && logged67++ < 4) {
+                    GGML_LOG_WARN("LP0067_DP4A_GQA6 q=%lld kv=%lld\n", (long long) Q->ne[1], (long long) K->ne[1]);
+                }
+                launch_fattn<256, 4, 8, true>(ctx, dst, lpdp4a_tile<256, 256, 4, 8, false, true, true>, 8, 0, 32,
+                    false, false, false, false, 32);
+                return;
+            }
             if (Q->ne[1] == 1) { lp0024_launch< 8>(ctx, dst, cc); }
             if (Q->ne[1] == 2) { lp0024_launch<16>(ctx, dst, cc); }
             if (Q->ne[1] == 3) { lp0024_launch<32>(ctx, dst, cc); }
