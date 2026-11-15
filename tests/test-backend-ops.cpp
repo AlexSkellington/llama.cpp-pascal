@@ -13278,6 +13278,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // KV-head counts that do not divide the device count
+    // local patch 0071: K q8_0 + V q4_0 on every lab route: GQA-6 (Qwen3.8: vec, lp0024 fold, 0067), GQA-8 (Qwen3.6: 0031),
+    // prefill (0027 V8T), generic fused tile (short KV)
+    for (int nr2 : { 6, 8, }) {
+        for (int nb : { 1, 2, 3, 5, 16, 64, 128, 512, }) {
+            for (int kv : { 512, 2048, 4096, 8192 + 77, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+            }
+        }
+    }
+    for (int nb : { 3, 8, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                        GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    }
     // local patch 0067: Qwen3.8 shape -- head 256, GQA 6, q8_0 K/V, decode / MTP verify, long KV (DP4A fold route)
     for (int nb : { 1, 2, 3, }) {
         for (int kv : { 4096, 8192, 8192 + 77, }) {
