@@ -3,3 +3,4 @@
 #include "../mmq.cuh"
 
 DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+DECL_MMQ_CASE_LPMOE(GGML_TYPE_IQ4_XS); // local patch 0070

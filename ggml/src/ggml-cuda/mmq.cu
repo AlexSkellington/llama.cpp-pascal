@@ -80,6 +80,10 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
+            if (prec_src1 == GGML_PREC_Q8_LPMOE) { // local patch 0070
+                mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8_LPMOE>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_NL:
@@ -270,7 +274,8 @@ static bool lab_mmq_mul_mat_q(
         static const bool lp0068 = [] { const char * e = getenv("GGML_CUDA_LP0068"); return !(e && e[0] == '0'); }();
         if (lp0068 && ids && prec_src1 == GGML_PREC_Q8 && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                 ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_VOLTA &&
-                (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K)) {
+                (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
+                 src0->type == GGML_TYPE_IQ4_XS)) { // + IQ4_XS: local patch 0070
             prec_src1 = GGML_PREC_Q8_LPMOE;
         }
     }
