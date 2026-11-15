@@ -1,6 +1,10 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// local patch 0062: MUL_MAT_ID (MoE kernel) token cap, separate from the dense MMVQ cap
+#ifndef MMVQ_MOE_MAX_BATCH_SIZE
+#define MMVQ_MOE_MAX_BATCH_SIZE 16
+#endif
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
