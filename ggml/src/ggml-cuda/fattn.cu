@@ -783,7 +783,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // local patch 0079: the lab tile / DP4A kernels read q8_0 directly and beat the vec kernel for 1- and
+            // 2-token batches too (-17..-76% on the P5000); keep vec only where the tile path would need F16 copies.
+            static const bool lp79 = [] { const char * e = getenv("GGML_CUDA_LP0079"); return !(e && atoi(e) == 0); }();
+            const bool lp79_tile = lp79 && ggml_cuda_fattn_tile_fused_q8(dst, ggml_cuda_info().devices[device].cc);
+            if (Q->ne[1] <= 2 && !lp79_tile) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
