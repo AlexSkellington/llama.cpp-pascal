@@ -1,6 +1,10 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#ifndef LP73_ON
+#define LP73_ON 1 // local patch 0073: K8T pre-pass for the 0027 prefill kernel
+#endif
+
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
 
@@ -1282,9 +1286,17 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     // LP_DP4A_PREFILL: load packed Q8 keys cooperatively, transposed in shared memory.
     static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1, "prototype layout"); // 0067: fold_gqa allowed
     constexpr int words = DKQ/4;
-    constexpr int pitch = nbatch_fa+1;
+    constexpr bool lp73 = LP73_ON && !kv_q8 && nbatch_fa == 32; // local patch 0073: K8T tile copy (prefill)
+    constexpr int pitch = lp73 ? nbatch_fa : nbatch_fa+1;
     int * const packed_K = (int *) KV_tmp;
     const block_q8_0 * const keys = (const block_q8_0 *) K_h2;
+    if constexpr (lp73) {
+        constexpr int tile_i4 = (words*nbatch_fa + (DKQ/32)*nbatch_fa)/4;
+        const int4 * const src = (const int4 *) ((const int *) K_h2 + int64_t(k_VKQ_0/nbatch_fa)*(tile_i4*4));
+        for (int e = threadIdx.y*warp_size+threadIdx.x; e < tile_i4; e += nwarps*warp_size) {
+            ((int4 *) KV_tmp)[e] = src[e];
+        }
+    } else
     for (int t = threadIdx.y*warp_size+threadIdx.x; t < nbatch_fa*words; t += nwarps*warp_size) {
         const int row=t/words, word=t%words, block=word/8;
         int packed=0; float d=0.0f;
@@ -2000,6 +2012,33 @@ static void lp0024_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, co
 }
 
 
+// local patch 0073: per KV head and 32-key tile: K8T[word][key] (the q8_0 int8 values of 4 dims, unchanged) followed by
+// the q8_0 scales [block][key]; 2304 ints per tile = 0027's shared-memory K tile with pitch 32. Keys >= KV are zero.
+static __global__ void lp73_k8t(const char * __restrict__ K, const int64_t KV, const int64_t ntiles, const int64_t nh,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, int * __restrict__ out) {
+    constexpr int WORDS = 64, NB = 8;
+    const int64_t hs = blockIdx.y, seq = hs / nh, head = hs % nh;
+    const char * const kh = K + seq*nb3 + head*nb2;
+    for (int64_t e = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; e < ntiles*(WORDS + NB)*32; e += int64_t(gridDim.x)*blockDim.x) {
+        const int64_t tile = e / ((WORDS + NB)*32);
+        const int r = int(e % ((WORDS + NB)*32)), word = r / 32, key = r % 32;
+        const int64_t k = tile*32 + key;
+        int v = 0;
+        if (k < KV) {
+            if (word < WORDS) {
+                const block_q8_0 * blk = (const block_q8_0 *) (kh + k*nb1) + word/8;
+                const uint16_t * q = (const uint16_t *) (blk->qs + 4*(word%8));
+                v = int(uint32_t(q[0]) | (uint32_t(q[1]) << 16));
+            } else {
+                const block_q8_0 * blk = (const block_q8_0 *) (kh + k*nb1) + (word - WORDS);
+                const float d = __half2float(blk->d);
+                v = __float_as_int(d);
+            }
+        }
+        out[(hs*ntiles + tile)*((WORDS + NB)*32) + r] = v;
+    }
+}
+
 // local patch 0050: per KV head and 32-key tile: V8T[kg][dim] (int8 of keys 4kg..4kg+3, one scale per (tile, dim))
 // followed by the 256 per-dim scales; 2304 words per tile. Keys >= KV are zero.
 static __global__ void lp50_v8t(const char * __restrict__ V, const int64_t KV, const int64_t ntiles, const int64_t nh,
@@ -2074,7 +2113,25 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                 Vt.nb[3] = size_t(nh*ntiles*2304)*sizeof(int);
                 ggml_tensor * const V_orig = dst->src[2];
                 dst->src[2] = &Vt;
+                ggml_tensor * const K_orig = dst->src[1];
+#if LP73_ON
+                // local patch 0073: K repacked once per call into 0027's shared-memory tile layout
+                const int64_t nhk = K->ne[2], nsk = K->ne[3];
+                ggml_cuda_pool_alloc<int> k8t(ctx.pool(), size_t(nsk*nhk*ntiles*2304));
+                {
+                    const int64_t nworkk = ntiles*2304;
+                    const dim3 cgk(unsigned((nworkk + 255)/256 < 1024 ? (nworkk + 255)/256 : 1024), unsigned(nsk*nhk));
+                    lp73_k8t<<<cgk, 256, 0, ctx.stream()>>>((const char *) K->data, K->ne[1], ntiles, nhk, K->nb[1], K->nb[2], K->nb[3], k8t.get());
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                ggml_tensor Kt = *K;
+                Kt.data  = k8t.get();
+                Kt.nb[2] = size_t(ntiles*2304)*sizeof(int);
+                Kt.nb[3] = size_t(nhk*ntiles*2304)*sizeof(int);
+                dst->src[1] = &Kt;
+#endif
                 launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false>,8,0,32,false,false,false,false,warp_size);
+                dst->src[1] = K_orig;
                 dst->src[2] = V_orig;
             }
             return;
