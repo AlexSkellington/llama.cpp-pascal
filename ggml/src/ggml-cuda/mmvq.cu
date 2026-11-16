@@ -1,4 +1,13 @@
 #include "mmvq.cuh"
+#if __has_include("lp83-knobs.h")
+#include "lp83-knobs.h"
+#endif
+#ifndef LP83_NW
+#define LP83_NW 1   // local patch 0083: IQ4_XS 4..8 tokens, big matrices
+#endif
+#ifndef LP83_RPB
+#define LP83_RPB 4  // local patch 0083
+#endif
 #if __has_include("mmvq-moe-tune.h")
 #include "mmvq-moe-tune.h"
 #endif
@@ -489,6 +498,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         if (small_k && ncols_dst >= 4 && lp72_has(type)) {
             return LP72_NW; // local patch 0072
         }
+        if (!small_k && ncols_dst >= 4 && type == GGML_TYPE_IQ4_XS) {
+            return LP83_NW; // local patch 0083
+        }
 #ifdef MMVQ_AUTOTUNE
         if (const int w = mmvq_at_nw(type, ncols_dst, small_k, halve_iters); w > 0) {
             return w;
@@ -643,6 +655,9 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC && small_k && ncols_dst >= 4 && lp72_has(type)) {
         return LP72_RPB; // local patch 0072
+    }
+    if (table_id == MMVQ_PARAMETERS_GENERIC && !small_k && ncols_dst >= 4 && type == GGML_TYPE_IQ4_XS) {
+        return LP83_RPB; // local patch 0083
     }
 #ifdef MMVQ_AUTOTUNE
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
