@@ -1006,7 +1006,13 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 #define LP0077_DEFAULT_MOE 1
 #endif
 #ifndef LP0077_DEFAULT_DENSE
-#define LP0077_DEFAULT_DENSE 0
+#define LP0077_DEFAULT_DENSE 1   // local patch 0077b: dense passed against BF16 (Qwen3.8)
+#endif
+#ifndef LP0077_MODE_MOE
+#define LP0077_MODE_MOE 0        // local patch 0077b: linear int8 for MoE
+#endif
+#ifndef LP0077_MODE_DENSE
+#define LP0077_MODE_DENSE 2      // local patch 0077b: cube-root companding for dense
 #endif
 static std::atomic<int> lp0077_moe_seen{0};
 static inline void lp0077_note_tensor(const ggml_tensor * t) {
@@ -1619,9 +1625,9 @@ static void lp0077_init(ggml_backend_cuda_comm_context * c) {
     c->lp0077_max    = mx ? atoll(mx) : 6291456;
     c->lp0077_blocks = nb ? atoi(nb) : 20;
     const char * md = getenv("GGML_CUDA_LP0077_MODE");
-    c->lp0077_mode   = md ? atoi(md) : 0;
-    if (c->lp0077_mode < 0 || c->lp0077_mode > 2) {
-        c->lp0077_mode = 0;
+    c->lp0077_mode   = md ? atoi(md) : -1;   // local patch 0077b: -1 = per-architecture default
+    if (c->lp0077_mode < -1 || c->lp0077_mode > 2) {
+        c->lp0077_mode = -1;
     }
     if (c->lp0077_max <= 0 || c->lp0077_max % 512 != 0 || c->lp0077_blocks < 1 || c->lp0077_blocks > LP0077_MAX_BLOCKS) {
         GGML_LOG_WARN("LP0077: invalid GGML_CUDA_LP0077_MAX/_BLOCKS; disabled\n");
@@ -1645,7 +1651,8 @@ static void lp0077_init(ggml_backend_cuda_comm_context * c) {
 static void lp0077_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_tensor ** tensors, const int64_t ne) {
     static std::atomic<int> logged{0};
     if (logged.exchange(1) == 0) {
-        GGML_LOG_WARN("LP0077: int8 all-reduce in use (%s model)\n", lp0077_moe_seen.load() ? "MoE" : "dense");
+        GGML_LOG_WARN("LP0077: int8 all-reduce in use (%s model, mode %d)\n", lp0077_moe_seen.load() ? "MoE" : "dense",
+                      c->lp0077_mode >= 0 ? c->lp0077_mode : (lp0077_moe_seen.load() ? LP0077_MODE_MOE : LP0077_MODE_DENSE));
     }
     for (int r = 0; r < 2; ++r) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[r]->context;
@@ -1655,7 +1662,8 @@ static void lp0077_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_ten
         }
         lp0077_allreduce_q8<<<c->lp0077_blocks, 256, 0, cuda_ctx->stream()>>>(
             (float *) tensors[r]->data, c->lp0077_qs[1 - r], c->lp0077_d[1 - r], c->lp0077_flag[1 - r],
-            c->lp0077_qs[r], c->lp0077_d[r], c->lp0077_flag[r], c->lp0077_cnt[r], ne, c->lp0077_max, c->lp0077_mode);
+            c->lp0077_qs[r], c->lp0077_d[r], c->lp0077_flag[r], c->lp0077_cnt[r], ne, c->lp0077_max,
+            c->lp0077_mode >= 0 ? c->lp0077_mode : (lp0077_moe_seen.load(std::memory_order_relaxed) ? LP0077_MODE_MOE : LP0077_MODE_DENSE));   // 0077b
         CUDA_CHECK(cudaGetLastError());
     }
 }
