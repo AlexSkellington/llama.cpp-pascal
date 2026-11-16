@@ -1000,7 +1000,23 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// local patch 0077: architecture detection. A model is MoE when it loads expert weights (tensor name contains
+// "_exps") or runs MUL_MAT_ID; otherwise dense. Process-wide (a router child serves one model).
+#ifndef LP0077_DEFAULT_MOE
+#define LP0077_DEFAULT_MOE 1
+#endif
+#ifndef LP0077_DEFAULT_DENSE
+#define LP0077_DEFAULT_DENSE 0
+#endif
+static std::atomic<int> lp0077_moe_seen{0};
+static inline void lp0077_note_tensor(const ggml_tensor * t) {
+    if (t != nullptr && strstr(t->name, "_exps") != nullptr) {
+        lp0077_moe_seen.store(1, std::memory_order_relaxed);
+    }
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    lp0077_note_tensor(tensor);   // local patch 0077
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -1018,6 +1034,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    lp0077_note_tensor(tensor);   // local patch 0077
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -1042,6 +1059,7 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
     ggml_cuda_set_device(ctx->device);
 
     for (size_t i = 0; i < n_tensors; i++) {
+        lp0077_note_tensor(tensors[i]);   // local patch 0077
         if (sizes[i] == 0) {
             continue;
         }
@@ -1304,6 +1322,17 @@ struct ggml_backend_cuda_comm_context {
     float *                     lp0029_recv[2] = {nullptr, nullptr};   // on device r: 2 slots x lp0029_max floats
     unsigned int *              lp0029_flag[2] = {nullptr, nullptr};   // on device r: written by the peer
     unsigned int *              lp0029_cnt[2]  = {nullptr, nullptr};   // on device r: per-block call counter
+    // local patch 0077: one-shot direct-P2P int8 (q8_0-style) all-reduce for LARGE tensors (needs 0029's peer setup).
+    bool                        lp0077_ready  = false;
+    bool                        lp0077_moe    = false;  // enabled for MoE models (expert weights / MUL_MAT_ID seen)
+    bool                        lp0077_dense  = false;  // enabled for dense models
+    int                         lp0077_blocks = 20;
+    int                         lp0077_mode   = 0;      // 0 linear, 1 sqrt companding, 2 cube-root companding
+    int64_t                     lp0077_max    = 0;
+    int8_t *                    lp0077_qs[2]   = {nullptr, nullptr};
+    half *                      lp0077_d[2]    = {nullptr, nullptr};
+    unsigned int *              lp0077_flag[2] = {nullptr, nullptr};
+    unsigned int *              lp0077_cnt[2]  = {nullptr, nullptr};
 
     // Number of ranks in the communicator when each rank is a separate process. Zero unless
     // comm_init_rank created this context.
@@ -1327,6 +1356,15 @@ struct ggml_backend_cuda_comm_context {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
 #endif // GGML_USE_NCCL
+        for (int r = 0; r < 2; ++r) {   // local patch 0077
+            if (lp0077_qs[r] || lp0077_d[r] || lp0077_flag[r] || lp0077_cnt[r]) {
+                ggml_cuda_set_device(dev_ids[r]);
+                if (lp0077_qs[r])   { (void) cudaFree(lp0077_qs[r]);   }
+                if (lp0077_d[r])    { (void) cudaFree(lp0077_d[r]);    }
+                if (lp0077_flag[r]) { (void) cudaFree(lp0077_flag[r]); }
+                if (lp0077_cnt[r])  { (void) cudaFree(lp0077_cnt[r]);  }
+            }
+        }
         for (int r = 0; r < 2; ++r) {   // local patch 0029
             if (lp0029_recv[r] || lp0029_flag[r] || lp0029_cnt[r]) {
                 ggml_cuda_set_device(dev_ids[r]);
@@ -1429,6 +1467,199 @@ static void lp0029_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_ten
     }
 }
 
+// ---------------------------------------------------------------------------
+// local patch 0077: one-shot direct-P2P all-reduce with an int8 payload (32-element blocks, fp16 scale), 2 GPUs.
+// ---------------------------------------------------------------------------
+#define LP0077_MAX_BLOCKS 64
+
+// Each thread owns 16 consecutive elements; lanes 2k / 2k+1 form one 32-element group (one fp16 scale).
+// All peer stores are 16 bytes wide (p2pbench, P5000 pair: 4-byte stores 2.5 GB/s, 8-byte 3.9, 16-byte 4.3).
+static __device__ __forceinline__ float lp0077_amax(const float4 v) {
+    return fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+}
+
+// mode 0: linear int8 (x = q*h, h = fp16(max/127)); mode 1: square-root companding (x = q*|q| * h/127^2, h = fp16(max));
+// mode 2: cube-root companding (x = q^3 * h/127^3). Companding keeps small values next to a massive activation usable.
+static __device__ __forceinline__ int lp0077_q1(const float x, const float inv, const int mode) {
+    if (mode == 0) {
+        return max(-127, min(127, __float2int_rn(__fmul_rn(x, inv))));
+    }
+    const float r = fminf(__fmul_rn(fabsf(x), inv), 1.0f);
+    const int   q = __float2int_rn(__fmul_rn(127.0f, mode == 1 ? sqrtf(r) : cbrtf(r)));
+    return x < 0.0f ? -q : q;
+}
+
+static __device__ __forceinline__ int lp0077_pack(const float4 v, const float inv, const int mode) {
+    const int q0 = lp0077_q1(v.x, inv, mode), q1 = lp0077_q1(v.y, inv, mode), q2 = lp0077_q1(v.z, inv, mode), q3 = lp0077_q1(v.w, inv, mode);
+    return (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+}
+
+static __device__ __forceinline__ float lp0077_factor(const float h, const int mode) {   // dequant factor from the fp16 scale
+    return mode == 0 ? h : __fmul_rn(h, mode == 1 ? (1.0f/16129.0f) : (1.0f/2048383.0f));
+}
+
+// h = the fp16 scale as sent (float), f = its dequant factor, q = 16 packed int8
+static __device__ __forceinline__ void lp0077_quant(const float4 * v, const int mode, float & h, float & f, int4 & q) {
+    float m = fmaxf(fmaxf(lp0077_amax(v[0]), lp0077_amax(v[1])), fmaxf(lp0077_amax(v[2]), lp0077_amax(v[3])));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+    h = __half2float(__float2half(fminf(mode == 0 ? m * (1.0f/127.0f) : m, 65000.0f)));   // fp16-exact, no overflow to inf
+    f = lp0077_factor(h, mode);
+    const float inv = h > 0.0f ? 1.0f/h : 0.0f;
+    q = make_int4(lp0077_pack(v[0], inv, mode), lp0077_pack(v[1], inv, mode), lp0077_pack(v[2], inv, mode), lp0077_pack(v[3], inv, mode));
+}
+
+static __device__ __forceinline__ float lp0077_g(const int p, const int sh, const int mode) {   // exact integer in float
+    const float b = (float) (int8_t) ((p >> sh) & 0xFF);
+    return mode == 0 ? b : mode == 1 ? b*fabsf(b) : b*b*b;
+}
+
+static __device__ __forceinline__ float4 lp0077_sum(const int p, const float f, const int u, const float fp, const int mode) {
+    float4 o;   // deq(own as sent) + deq(peer), explicit rounding: bit-identical on both ranks
+    o.x = __fadd_rn(__fmul_rn(lp0077_g(p,  0, mode), f), __fmul_rn(lp0077_g(u,  0, mode), fp));
+    o.y = __fadd_rn(__fmul_rn(lp0077_g(p,  8, mode), f), __fmul_rn(lp0077_g(u,  8, mode), fp));
+    o.z = __fadd_rn(__fmul_rn(lp0077_g(p, 16, mode), f), __fmul_rn(lp0077_g(u, 16, mode), fp));
+    o.w = __fadd_rn(__fmul_rn(lp0077_g(p, 24, mode), f), __fmul_rn(lp0077_g(u, 24, mode), fp));
+    return o;
+}
+
+static __global__ void lp0077_allreduce_q8(
+        float * __restrict__ data, int8_t * __restrict__ peer_qs, half * __restrict__ peer_d, unsigned int * __restrict__ peer_flag,
+        const int8_t * __restrict__ my_qs, const half * __restrict__ my_d, const unsigned int * __restrict__ my_flag,
+        unsigned int * __restrict__ my_cnt, const int64_t ne, const int64_t slot_stride, const int mode) {
+    __shared__ unsigned int token;
+    const int b = blockIdx.x;
+    if (threadIdx.x == 0) {
+        token = my_cnt[b] + 1u;
+        my_cnt[b] = token;
+    }
+    __syncthreads();
+    const int64_t slot = (int64_t) (token & 1u) * slot_stride;           // elements (multiple of 512)
+    const int64_t nw   = ne / 512;                                       // warp rows of 32 threads x 16 elements
+    const int64_t per  = (nw + gridDim.x - 1) / gridDim.x;
+    const int64_t c0   = (int64_t) b * per * 32;                         // 16-element chunks, warp aligned
+    const int64_t c1   = ((int64_t) b * per + per < nw ? (int64_t) b * per + per : nw) * 32;
+    const float4 * d4  = (const float4 *) data;
+    const int lane     = threadIdx.x & 31;
+    int4 * pq = (int4 *) (peer_qs + slot);
+    int4 * pd = (int4 *) (peer_d + slot/32);                             // 8 fp16 scales per int4
+    for (int64_t cb = c0; cb < c1; cb += blockDim.x) {
+        const int64_t c = cb + threadIdx.x;
+        const bool act = c < c1;                                         // whole warps are active or inactive
+        float4 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            v[k] = act ? d4[4*c + k] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        float h, f; int4 q;
+        lp0077_quant(v, mode, h, f, q);
+        const int hb = (int) __half_as_ushort(__float2half(h));
+        int4 sc;                                                         // lanes 0/1 gather the warp's 16 scales
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int lo = __shfl_sync(0xffffffffu, hb, ((lane & 1) << 4) + 4*j);
+            const int hi = __shfl_sync(0xffffffffu, hb, ((lane & 1) << 4) + 4*j + 2);
+            ((int *) &sc)[j] = lo | (hi << 16);
+        }
+        if (act) {
+            pq[c] = q;                                                     // 16-byte P2P store
+            if (lane < 2) {
+                pd[(c - lane)/16 + lane] = sc;                             // 16-byte P2P store
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *((volatile unsigned int *) peer_flag + b) = token;
+        while ((int) (*((volatile const unsigned int *) my_flag + b) - token) < 0) { }
+        __threadfence();
+    }
+    __syncthreads();
+    const int4 * mq = (const int4 *) (my_qs + slot);
+    const half * md = my_d + slot/32;
+    float4 * w4 = (float4 *) data;
+    for (int64_t cb = c0; cb < c1; cb += blockDim.x) {
+        const int64_t c = cb + threadIdx.x;
+        const bool act = c < c1;
+        float4 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            v[k] = act ? d4[4*c + k] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        float h, f; int4 q;
+        lp0077_quant(v, mode, h, f, q);                                    // own value exactly as sent
+        if (act) {
+            const int4  u  = __ldcg(mq + c);
+            // the peer wrote the scales through P2P: a plain load of a const __restrict__ pointer may be served from the
+            // non-coherent read-only cache (stale scale from two calls ago) -> __ldcg like the data
+            const float fp = lp0077_factor(__half2float(__ushort_as_half(__ldcg((const unsigned short *) md + c/2))), mode);
+            w4[4*c + 0] = lp0077_sum(q.x, f, u.x, fp, mode);
+            w4[4*c + 1] = lp0077_sum(q.y, f, u.y, fp, mode);
+            w4[4*c + 2] = lp0077_sum(q.z, f, u.z, fp, mode);
+            w4[4*c + 3] = lp0077_sum(q.w, f, u.w, fp, mode);
+        }
+    }
+}
+
+static bool lp0077_arch_on(const ggml_backend_cuda_comm_context * c) {
+    return lp0077_moe_seen.load(std::memory_order_relaxed) ? c->lp0077_moe : c->lp0077_dense;
+}
+
+static void lp0077_init(ggml_backend_cuda_comm_context * c) {
+    // GGML_CUDA_LP0077: 0 = off, 1 = every model, moe = MoE models only, dense = dense models only.
+    // Built-in default = the architectures that passed the lab's KLD + speed gate.
+    const char * on = getenv("GGML_CUDA_LP0077");
+    c->lp0077_moe   = on ? (strcmp(on, "1") == 0 || strcmp(on, "moe") == 0)   : LP0077_DEFAULT_MOE;
+    c->lp0077_dense = on ? (strcmp(on, "1") == 0 || strcmp(on, "dense") == 0) : LP0077_DEFAULT_DENSE;
+    if (!c->lp0029_ready || !(c->lp0077_moe || c->lp0077_dense)) {
+        return;
+    }
+    const char * mx = getenv("GGML_CUDA_LP0077_MAX");
+    const char * nb = getenv("GGML_CUDA_LP0077_BLOCKS");
+    c->lp0077_max    = mx ? atoll(mx) : 6291456;
+    c->lp0077_blocks = nb ? atoi(nb) : 20;
+    const char * md = getenv("GGML_CUDA_LP0077_MODE");
+    c->lp0077_mode   = md ? atoi(md) : 0;
+    if (c->lp0077_mode < 0 || c->lp0077_mode > 2) {
+        c->lp0077_mode = 0;
+    }
+    if (c->lp0077_max <= 0 || c->lp0077_max % 512 != 0 || c->lp0077_blocks < 1 || c->lp0077_blocks > LP0077_MAX_BLOCKS) {
+        GGML_LOG_WARN("LP0077: invalid GGML_CUDA_LP0077_MAX/_BLOCKS; disabled\n");
+        return;
+    }
+    for (int r = 0; r < 2; ++r) {
+        ggml_cuda_set_device(c->dev_ids[r]);
+        CUDA_CHECK(cudaMalloc(&c->lp0077_qs[r],   2 * c->lp0077_max));
+        CUDA_CHECK(cudaMalloc(&c->lp0077_d[r],    2 * (c->lp0077_max/32) * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&c->lp0077_flag[r], LP0077_MAX_BLOCKS * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&c->lp0077_cnt[r],  LP0077_MAX_BLOCKS * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(c->lp0077_flag[r], 0, LP0077_MAX_BLOCKS * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(c->lp0077_cnt[r],  0, LP0077_MAX_BLOCKS * sizeof(unsigned int)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    c->lp0077_ready = true;
+    GGML_LOG_WARN("LP0077: direct-P2P int8 all-reduce for FP32 tensors <= %lld elements (%d blocks, mode %d, moe %d, dense %d)\n",
+                  (long long) c->lp0077_max, c->lp0077_blocks, c->lp0077_mode, (int) c->lp0077_moe, (int) c->lp0077_dense);
+}
+
+static void lp0077_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_tensor ** tensors, const int64_t ne) {
+    static std::atomic<int> logged{0};
+    if (logged.exchange(1) == 0) {
+        GGML_LOG_WARN("LP0077: int8 all-reduce in use (%s model)\n", lp0077_moe_seen.load() ? "MoE" : "dense");
+    }
+    for (int r = 0; r < 2; ++r) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[r]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        if ((tensors[r]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[r]->data, 0, ggml_nbytes(tensors[r]), cuda_ctx->stream()));
+        }
+        lp0077_allreduce_q8<<<c->lp0077_blocks, 256, 0, cuda_ctx->stream()>>>(
+            (float *) tensors[r]->data, c->lp0077_qs[1 - r], c->lp0077_d[1 - r], c->lp0077_flag[1 - r],
+            c->lp0077_qs[r], c->lp0077_d[r], c->lp0077_flag[r], c->lp0077_cnt[r], ne, c->lp0077_max, c->lp0077_mode);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
@@ -1471,6 +1702,13 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
         }
         NCCL_CHECK(ncclGroupEnd());
+        return true;
+    }
+
+    if (comm_ctx->lp0077_ready && lp0077_arch_on(comm_ctx) && n_backends == 2 && ne <= comm_ctx->lp0077_max && ne % 512 == 0 &&
+            tensors[0]->type == GGML_TYPE_F32 && tensors[1]->type == GGML_TYPE_F32 &&
+            ((uintptr_t) tensors[0]->data & 0xF) == 0 && ((uintptr_t) tensors[1]->data & 0xF) == 0) {   // local patch 0077
+        lp0077_allreduce(comm_ctx, tensors, ne);
         return true;
     }
 
@@ -1630,6 +1868,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
         lp0029_init(ret);   // local patch 0029
+        lp0077_init(ret);   // local patch 0077
         return;
     }
 
@@ -3058,6 +3297,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
+            lp0077_moe_seen.store(1, std::memory_order_relaxed);   // local patch 0077
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
