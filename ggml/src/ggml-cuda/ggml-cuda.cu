@@ -1392,7 +1392,7 @@ struct ggml_backend_cuda_comm_context {
 static __global__ void lp0029_allreduce_f32(
         float * __restrict__ data, float * __restrict__ peer_recv, unsigned int * __restrict__ peer_flag,
         const float * __restrict__ my_recv, const unsigned int * __restrict__ my_flag, unsigned int * __restrict__ my_cnt,
-        const int64_t ne, const int64_t slot_stride) {
+        const int64_t ne, const int64_t slot_stride, const bool vec4) {   // local patch 0081: vec4 = float4 payload
     __shared__ unsigned int token;
     const int b = blockIdx.x;
     if (threadIdx.x == 0) {
@@ -1401,11 +1401,20 @@ static __global__ void lp0029_allreduce_f32(
     }
     __syncthreads();
     const int64_t slot = (int64_t) (token & 1u) * slot_stride;
-    const int64_t per  = (ne + gridDim.x - 1) / gridDim.x;
+    const int64_t nv   = vec4 ? ne / 4 : ne;                 // local patch 0081: work in float4 units
+    const int64_t per  = (nv + gridDim.x - 1) / gridDim.x;
     const int64_t i0   = (int64_t) b * per;
-    const int64_t i1   = i0 + per < ne ? i0 + per : ne;
+    const int64_t i1   = i0 + per < nv ? i0 + per : nv;
+    if (vec4) {
+        float4 * pr = (float4 *) (peer_recv + slot);
+        const float4 * dv = (const float4 *) data;
+        for (int64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
+            pr[i] = dv[i];                                   // 16-byte P2P store
+        }
+    } else {
     for (int64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
         peer_recv[slot + i] = data[i];                       // P2P store into the peer's receive slot
+    }
     }
     __threadfence_system();                                  // data visible system-wide before the flag
     __syncthreads();
@@ -1415,6 +1424,16 @@ static __global__ void lp0029_allreduce_f32(
         __threadfence();
     }
     __syncthreads();
+    if (vec4) {   // local patch 0081
+        float4 * dv = (float4 *) data;
+        const float4 * mr = (const float4 *) (my_recv + slot);
+        for (int64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
+            const float4 a = dv[i];
+            const float4 o = __ldcg(mr + i);
+            dv[i] = make_float4(a.x + o.x, a.y + o.y, a.z + o.z, a.w + o.w);
+        }
+        return;
+    }
     for (int64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
         data[i] = data[i] + __ldcg(my_recv + slot + i);      // a+b / b+a: commutative, identical on both ranks
     }
@@ -1463,12 +1482,16 @@ static void lp0029_init(ggml_backend_cuda_comm_context * c) {
 }
 
 static void lp0029_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_tensor ** tensors, const int64_t ne) {
+    // local patch 0081: float4 payload when both ranks can use it (same partition on both sides)
+    static const bool lp81 = [] { const char * e = getenv("GGML_CUDA_LP0081"); return !(e && atoi(e) == 0); }();
+    const bool vec4 = lp81 && ne % 4 == 0 && c->lp0029_max % 4 == 0 &&
+        ((uintptr_t) tensors[0]->data & 15) == 0 && ((uintptr_t) tensors[1]->data & 15) == 0;
     for (int r = 0; r < 2; ++r) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[r]->context;
         ggml_cuda_set_device(cuda_ctx->device);
         lp0029_allreduce_f32<<<c->lp0029_blocks, 256, 0, cuda_ctx->stream()>>>(
             (float *) tensors[r]->data, c->lp0029_recv[1 - r], c->lp0029_flag[1 - r],
-            c->lp0029_recv[r], c->lp0029_flag[r], c->lp0029_cnt[r], ne, c->lp0029_max);
+            c->lp0029_recv[r], c->lp0029_flag[r], c->lp0029_cnt[r], ne, c->lp0029_max, vec4);
         CUDA_CHECK(cudaGetLastError());
     }
 }
