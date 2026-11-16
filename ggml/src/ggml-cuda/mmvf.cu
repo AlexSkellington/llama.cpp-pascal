@@ -893,6 +893,11 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;
                 }
+                if (cc < GGML_CUDA_CC_VOLTA) {   // local patch 0080: Pascal small F32 matrices (GDN ssm_alpha/beta,
+                    // shared-expert gates) at 4..8 tokens: MMVF instead of cuBLAS sgemm / gemv (two-chat MTP decode)
+                    static const bool lp80 = [] { const char * e = getenv("GGML_CUDA_LP0080"); return !(e && atoi(e) == 0); }();
+                    return ne11 <= (lp80 ? MMVF_MAX_BATCH_SIZE : 3);
+                }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
