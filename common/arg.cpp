@@ -1700,6 +1700,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(   // local patch 0090
+        {"--split-overlap"},
+        {"--no-split-overlap"},
+        "split mode tensor: alternate ubatches of at least 64 tokens between two schedulers, so that the AllReduce of one\n"
+        "overlaps with the compute of the other; each has its own compute buffers (default: disabled)",
+        [](common_params & params, bool value) {
+            params.split_overlap = value;
+        }
+    ).set_env("LLAMA_ARG_SPLIT_OVERLAP").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

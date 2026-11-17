@@ -426,6 +426,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool split_overlap; // local patch 0090: split mode tensor, alternate large ubatches between two schedulers so
+                            // that the AllReduce of one overlaps with the compute of the other (own compute buffers)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

@@ -313,6 +313,12 @@ private:
     // create a new backend scheduler with the given parameters, unless the current one can be reused
     void sched_new(const sched_params & params);
 
+    // local patch 0090: reserve the compute buffers of the active scheduler lane
+    void sched_reserve_lane();
+
+    // local patch 0090: make a scheduler lane the active one (sched, sched_params_cur, gf_res_prev, backend_ptrs)
+    void lane_switch(int lane);
+
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -475,6 +481,24 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // local patch 0090 (PR Piggidragon#17): lanes (split_overlap, split mode tensor). Consecutive large ubatches
+    // alternate between two schedulers whose meta backends compute on their own streams, so that the AllReduce of
+    // one ubatch overlaps with the compute of the other. Each lane has its own compute buffers. The inactive lane
+    // keeps its state here; outside of decode() lane 0 is always the active one.
+    struct sched_lane {
+        ggml_backend_sched_ptr              sched;
+        sched_params                        params_cur;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *                  gf_res_prev_active = nullptr;
+        std::vector<ggml_backend_t>         backend_ptrs;
+    };
+    sched_lane       lane_other;
+    int              lane_active = 0;
+    int              lane_next   = 1;      // the lane of the next large ubatch
+    bool             lanes       = false;
+    const uint32_t   lanes_min_tokens = 64; // smaller ubatches stay on lane 0
+    ggml_backend_ptr backend_lane1;         // the meta backend of lane 1
 
     // local patch 0085: per-shape schedulers for the MTP draft context (see apply0085.py)
     struct lp85_slot {

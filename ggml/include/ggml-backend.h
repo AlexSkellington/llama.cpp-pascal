@@ -447,6 +447,13 @@ extern "C" {
     // create a new meta device from "simple" devices, meta buffer type/buffer/backend is then derived from this:
     // TODO: this looks a bit strange - a backend API creates a device. I think we should try
     //       express this as a backend registry functionality instead
+    // local patch 0090 (PR Piggidragon#17): let two backends of the same meta device compute consecutive graphs as
+    // lanes: each lane runs on its own streams, and a subgraph waits for the subgraphs of the other lane that last
+    // touched the same state tensors (KV cache, recurrent state), so the AllReduce of one lane overlaps with the
+    // compute of the other. The graphs must not share intermediate buffers (one scheduler per lane).
+    // Returns false if a device has no events.
+    GGML_API bool ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b);
+
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 

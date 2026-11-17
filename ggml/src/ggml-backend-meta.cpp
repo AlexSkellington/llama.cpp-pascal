@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <unordered_map>   // local patch 0090
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -2091,6 +2092,9 @@ struct ggml_backend_meta_context {
             std::vector<ggml_tensor *> nodes;
         };
         std::vector<per_backend> pb;
+
+        // local patch 0090: lanes; the state tensors (by view root) that each subgraph reads or writes
+        std::vector<std::vector<const ggml_tensor *>> lane_touch;
     };
     static constexpr size_t N_PLANS = 16;
 
@@ -2109,6 +2113,15 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+
+    // local patch 0090: lanes, meta backends of one device that compute consecutive graphs on their own streams so
+    // that the AllReduce of one graph overlaps with the compute of the other, see ggml_backend_meta_share_lanes()
+    struct lane_group {
+        ggml_backend_meta_context * ctx[2] = { nullptr, nullptr };
+    };
+    std::shared_ptr<lane_group>                    lanes;
+    std::vector<std::vector<ggml_backend_event_t>> lane_events;     // [subgraph][simple backend], recorded once computed
+    std::unordered_map<const ggml_tensor *, size_t> lane_last_touch; // state tensor -> last subgraph index that touched it
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2144,6 +2157,18 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & events : lane_events) {   // local patch 0090
+            for (ggml_backend_event_t event : events) {
+                ggml_backend_event_free(event);
+            }
+        }
+        if (lanes) {
+            for (auto & c : lanes->ctx) {
+                if (c == this) {
+                    c = nullptr;
+                }
+            }
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2700,6 +2725,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     const size_t n_subgraphs_exec = plan->n_subgraphs;
 
+    // local patch 0090: lanes. A subgraph waits on each device for the subgraphs of the other lane that last read or
+    // wrote the state tensors it reads or writes (KV cache, recurrent state), whichever graph and subgraph index that
+    // was. The AllReduce after a subgraph is not waited for, it overlaps with the compute of the other lane. An event
+    // that the other lane recorded again since is later in its stream, so waiting for it waits for at least as much.
+    ggml_backend_meta_context * lane_other = nullptr;
+    if (backend_ctx->lanes) {
+        if (plan->lane_touch.size() != n_subgraphs_exec) {
+            auto state_root = [](const ggml_tensor * t) -> const ggml_tensor * {
+                while (t->view_src != nullptr) {
+                    t = t->view_src;
+                }
+                if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+                    return nullptr;
+                }
+                const enum ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(t->buffer);
+                return usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE ? nullptr : t;
+            };
+            plan->lane_touch.assign(n_subgraphs_exec, {});
+            const auto & cfg = backend_ctx->backend_configs[0].cgraphs;
+            for (size_t i_graph = 0; i_graph < n_subgraphs_exec; i_graph++) {
+                auto & touch = plan->lane_touch[i_graph];
+                const int i_start_g = cfg[i_graph].offset;
+                const int i_stop_g  = i_graph + 1 < n_subgraphs_exec ? cfg[i_graph + 1].offset : cgraph->n_nodes;
+                for (int i_node = i_start_g; i_node < i_stop_g; i_node++) {
+                    const ggml_tensor * node = cgraph->nodes[i_node];
+                    if (const ggml_tensor * root = state_root(node)) {
+                        touch.push_back(root);
+                    }
+                    for (int k = 0; k < GGML_MAX_SRC; k++) {
+                        if (node->src[k] != nullptr) {
+                            if (const ggml_tensor * root = state_root(node->src[k])) {
+                                touch.push_back(root);
+                            }
+                        }
+                    }
+                }
+                std::sort(touch.begin(), touch.end());
+                touch.erase(std::unique(touch.begin(), touch.end()), touch.end());
+            }
+        }
+        lane_other = backend_ctx->lanes->ctx[0] == backend_ctx ? backend_ctx->lanes->ctx[1] : backend_ctx->lanes->ctx[0];
+        while (backend_ctx->lane_events.size() < n_subgraphs_exec) {
+            std::vector<ggml_backend_event_t> events(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                events[j] = ggml_backend_event_new(ggml_backend_get_device(backend_ctx->backend_configs[j].backend));
+                GGML_ASSERT(events[j] != nullptr);
+            }
+            backend_ctx->lane_events.push_back(std::move(events));
+        }
+    }
+    std::vector<size_t> lane_waits;
+
     size_t iga = 0; // i graph aux
     size_t ina = 0; // i node aux
 
@@ -2849,11 +2926,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
 
     for (size_t i = 0; i < n_subgraphs_exec; i++) {
+        lane_waits.clear();   // local patch 0090
+        if (lane_other != nullptr) {
+            for (const ggml_tensor * t : plan->lane_touch[i]) {
+                auto it = lane_other->lane_last_touch.find(t);
+                if (it != lane_other->lane_last_touch.end()) {
+                    lane_waits.push_back(it->second);
+                }
+            }
+            std::sort(lane_waits.begin(), lane_waits.end());
+            lane_waits.erase(std::unique(lane_waits.begin(), lane_waits.end()), lane_waits.end());
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            for (const size_t i_other : lane_waits) {
+                ggml_backend_event_wait(bcj.backend, lane_other->lane_events[i_other][j]);
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+            if (backend_ctx->lanes) {
+                ggml_backend_event_record(backend_ctx->lane_events[i][j], bcj.backend);
+            }
+        }
+        if (backend_ctx->lanes) {
+            for (const ggml_tensor * t : plan->lane_touch[i]) {
+                backend_ctx->lane_last_touch[t] = i;
             }
         }
 
@@ -2927,6 +3026,26 @@ struct ggml_tensor * ggml_backend_meta_tensor_part(const struct ggml_tensor * te
 }
 struct ggml_backend_meta_split_state ggml_backend_meta_tensor_split_state(const struct ggml_tensor * tensor) {
     return ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+}
+
+bool ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b) {   // local patch 0090
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend_a) && ggml_backend_is_meta(meta_backend_b));
+    GGML_ASSERT(meta_backend_a->device == meta_backend_b->device);
+    auto * ctx_a = (ggml_backend_meta_context *) meta_backend_a->context;
+    auto * ctx_b = (ggml_backend_meta_context *) meta_backend_b->context;
+    GGML_ASSERT(!ctx_a->lanes && !ctx_b->lanes);
+    for (const auto & bc : ctx_a->backend_configs) {   // the lanes are ordered with events on each device
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(ggml_backend_get_device(bc.backend), &props);
+        if (!props.caps.events) {
+            return false;
+        }
+    }
+    ctx_a->lanes = std::make_shared<ggml_backend_meta_context::lane_group>();
+    ctx_b->lanes = ctx_a->lanes;
+    ctx_a->lanes->ctx[0] = ctx_a;
+    ctx_a->lanes->ctx[1] = ctx_b;
+    return true;
 }
 
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {
