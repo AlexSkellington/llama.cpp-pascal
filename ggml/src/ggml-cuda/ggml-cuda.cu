@@ -1339,6 +1339,14 @@ struct ggml_backend_cuda_comm_context {
     half *                      lp0077_d[2]    = {nullptr, nullptr};
     unsigned int *              lp0077_flag[2] = {nullptr, nullptr};
     unsigned int *              lp0077_cnt[2]  = {nullptr, nullptr};
+    // local patch 0091: copy-engine transport for 0077 (send = local quantized copy, recv = written by the peer's DMA)
+    bool                        lp0091_on     = false;
+    int8_t *                    lp0091_sq[2]  = {nullptr, nullptr};
+    half *                      lp0091_sd[2]  = {nullptr, nullptr};
+    int8_t *                    lp0091_rq[2]  = {nullptr, nullptr};
+    half *                      lp0091_rd[2]  = {nullptr, nullptr};
+    cudaEvent_t                 lp0091_ev_copy[2] = {nullptr, nullptr};   // on device r: r's DMA into the peer is done
+    cudaEvent_t                 lp0091_ev_done[2] = {nullptr, nullptr};   // on device r: r's combine has read its recv
 
     // Number of ranks in the communicator when each rank is a separate process. Zero unless
     // comm_init_rank created this context.
@@ -1362,6 +1370,17 @@ struct ggml_backend_cuda_comm_context {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
 #endif // GGML_USE_NCCL
+        for (int r = 0; r < 2; ++r) {   // local patch 0091
+            if (lp0091_sq[r] || lp0091_ev_copy[r]) {
+                ggml_cuda_set_device(dev_ids[r]);
+                if (lp0091_sq[r]) { (void) cudaFree(lp0091_sq[r]); }
+                if (lp0091_sd[r]) { (void) cudaFree(lp0091_sd[r]); }
+                if (lp0091_rq[r]) { (void) cudaFree(lp0091_rq[r]); }
+                if (lp0091_rd[r]) { (void) cudaFree(lp0091_rd[r]); }
+                if (lp0091_ev_copy[r]) { (void) cudaEventDestroy(lp0091_ev_copy[r]); }
+                if (lp0091_ev_done[r]) { (void) cudaEventDestroy(lp0091_ev_done[r]); }
+            }
+        }
         for (int r = 0; r < 2; ++r) {   // local patch 0077
             if (lp0077_qs[r] || lp0077_d[r] || lp0077_flag[r] || lp0077_cnt[r]) {
                 ggml_cuda_set_device(dev_ids[r]);
@@ -1630,6 +1649,92 @@ static __global__ void lp0077_allreduce_q8(
     }
 }
 
+// local patch 0091: copy-engine transport for 0077. Chunk c = 16 elements; 32-element group g = c/2 (one fp16 scale).
+static __global__ void lp0091_quant(const float * __restrict__ data, int4 * __restrict__ sq, half * __restrict__ sd,
+                                    const int64_t nc, const int mode) {
+    const float4 * d4 = (const float4 *) data;
+    const int lane = threadIdx.x & 31;
+    // nc % 32 == 0 and blockDim % 32 == 0: whole warps are active or inactive (lp0077_quant shuffles lane pairs)
+    for (int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; c < nc; c += (int64_t) gridDim.x * blockDim.x) {
+        float4 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            v[k] = d4[4*c + k];
+        }
+        float h, f; int4 q;
+        lp0077_quant(v, mode, h, f, q);
+        sq[c] = q;
+        if ((lane & 1) == 0) {
+            sd[c/2] = __float2half(h);   // h is fp16-exact
+        }
+    }
+}
+
+static __global__ void lp0091_combine(float * __restrict__ data, const int4 * __restrict__ sq, const half * __restrict__ sd,
+                                      const int4 * __restrict__ rq, const half * __restrict__ rd, const int64_t nc, const int mode) {
+    float4 * w4 = (float4 *) data;
+    for (int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; c < nc; c += (int64_t) gridDim.x * blockDim.x) {
+        const int4  q  = sq[c];
+        const float f  = lp0077_factor(__half2float(sd[c/2]), mode);
+        const int4  u  = __ldcg(rq + c);   // written by the peer's DMA
+        const float fp = lp0077_factor(__half2float(__ushort_as_half(__ldcg((const unsigned short *) rd + c/2))), mode);
+        w4[4*c + 0] = lp0077_sum(q.x, f, u.x, fp, mode);
+        w4[4*c + 1] = lp0077_sum(q.y, f, u.y, fp, mode);
+        w4[4*c + 2] = lp0077_sum(q.z, f, u.z, fp, mode);
+        w4[4*c + 3] = lp0077_sum(q.w, f, u.w, fp, mode);
+    }
+}
+
+static void lp0091_init(ggml_backend_cuda_comm_context * c) {
+    const char * on = getenv("GGML_CUDA_LP0091");
+    if (!c->lp0077_ready || !on || atoi(on) == 0) {
+        return;
+    }
+    for (int r = 0; r < 2; ++r) {
+        ggml_cuda_set_device(c->dev_ids[r]);
+        CUDA_CHECK(cudaMalloc(&c->lp0091_sq[r], c->lp0077_max));
+        CUDA_CHECK(cudaMalloc(&c->lp0091_sd[r], (c->lp0077_max/32) * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&c->lp0091_rq[r], c->lp0077_max));
+        CUDA_CHECK(cudaMalloc(&c->lp0091_rd[r], (c->lp0077_max/32) * sizeof(half)));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->lp0091_ev_copy[r], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->lp0091_ev_done[r], cudaEventDisableTiming));
+    }
+    c->lp0091_on = true;
+    GGML_LOG_WARN("LP0091: 0077 int8 all-reduce over the copy engines (cudaMemcpyPeerAsync)\n");
+}
+
+static void lp0091_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_tensor ** tensors, const int64_t ne, const int mode) {
+    const int64_t nc = ne / 16;
+    const int nb = (int) std::min<int64_t>((nc + 255) / 256, 1024);
+    cudaStream_t st[2];
+    for (int r = 0; r < 2; ++r) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[r]->context;
+        st[r] = cuda_ctx->stream();
+        ggml_cuda_set_device(cuda_ctx->device);
+        if ((tensors[r]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[r]->data, 0, ggml_nbytes(tensors[r]), st[r]));
+        }
+        lp0091_quant<<<nb, 256, 0, st[r]>>>((const float *) tensors[r]->data, (int4 *) c->lp0091_sq[r], c->lp0091_sd[r], nc, mode);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    for (int r = 0; r < 2; ++r) {
+        ggml_cuda_set_device(c->dev_ids[r]);
+        // the peer's previous combine must have read its receive buffer before r overwrites it
+        CUDA_CHECK(cudaStreamWaitEvent(st[r], c->lp0091_ev_done[1 - r], 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(c->lp0091_rq[1 - r], c->dev_ids[1 - r], c->lp0091_sq[r], c->dev_ids[r], ne, st[r]));
+        CUDA_CHECK(cudaMemcpyPeerAsync(c->lp0091_rd[1 - r], c->dev_ids[1 - r], c->lp0091_sd[r], c->dev_ids[r], (ne/32) * sizeof(half), st[r]));
+        CUDA_CHECK(cudaEventRecord(c->lp0091_ev_copy[r], st[r]));
+    }
+    for (int r = 0; r < 2; ++r) {
+        ggml_cuda_set_device(c->dev_ids[r]);
+        CUDA_CHECK(cudaStreamWaitEvent(st[r], c->lp0091_ev_copy[1 - r], 0));
+        lp0091_combine<<<nb, 256, 0, st[r]>>>((float *) tensors[r]->data, (const int4 *) c->lp0091_sq[r], c->lp0091_sd[r],
+            (const int4 *) c->lp0091_rq[r], c->lp0091_rd[r], nc, mode);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(c->lp0091_ev_done[r], st[r]));
+    }
+}
+
 static bool lp0077_arch_on(const ggml_backend_cuda_comm_context * c) {
     return lp0077_moe_seen.load(std::memory_order_relaxed) ? c->lp0077_moe : c->lp0077_dense;
 }
@@ -1676,6 +1781,11 @@ static void lp0077_allreduce(ggml_backend_cuda_comm_context * c, struct ggml_ten
     if (logged.exchange(1) == 0) {
         GGML_LOG_WARN("LP0077: int8 all-reduce in use (%s model, mode %d)\n", lp0077_moe_seen.load() ? "MoE" : "dense",
                       c->lp0077_mode >= 0 ? c->lp0077_mode : (lp0077_moe_seen.load() ? LP0077_MODE_MOE : LP0077_MODE_DENSE));
+    }
+    if (c->lp0091_on) {   // local patch 0091
+        lp0091_allreduce(c, tensors, ne,
+            c->lp0077_mode >= 0 ? c->lp0077_mode : (lp0077_moe_seen.load(std::memory_order_relaxed) ? LP0077_MODE_MOE : LP0077_MODE_DENSE));
+        return;
     }
     for (int r = 0; r < 2; ++r) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[r]->context;
@@ -1900,6 +2010,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
         lp0029_init(ret);   // local patch 0029
         lp0077_init(ret);   // local patch 0077
+        lp0091_init(ret);   // local patch 0091
         return;
     }
 
