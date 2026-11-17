@@ -476,6 +476,21 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // local patch 0085: per-shape schedulers for the MTP draft context (see apply0085.py)
+    struct lp85_slot {
+        uint32_t n_tokens  = 0;
+        uint32_t n_outputs = 0;
+        uint64_t last_used = 0;
+        ggml_backend_sched_ptr            sched;
+        std::unique_ptr<llm_graph_result> gf_res;
+        llm_graph_result *                alloced = nullptr; // graph result whose allocation is live in this slot's scheduler
+    };
+    std::vector<lp85_slot> lp85_pool;
+    uint64_t               lp85_tick = 0;
+    ggml_backend_sched_t   sched_active = nullptr; // scheduler of the most recent ubatch (nullptr = main)
+    ggml_backend_sched_t   sched_cur() const { return sched_active ? sched_active : sched.get(); }
+    void                   lp85_invalidate();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
