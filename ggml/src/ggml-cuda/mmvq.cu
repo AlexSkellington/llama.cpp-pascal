@@ -696,6 +696,42 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
+// local patch 0084: IQ4_XS weight block decoded once, reused for every token column (bit-exact with 0037's dot).
+#ifndef LP84
+#define LP84 1
+#endif
+#ifndef LP84_MAXN
+#define LP84_MAXN 6   // 8 tokens regressed in the microbench (225 -> 312 us, register pressure)
+#endif
+struct lp84_w { int v[8]; int ls; float dx; };
+static __device__ __forceinline__ void lp84_load(const void * __restrict__ vbq, const int kbx, const int iqs, lp84_w & w) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+    const int2 qa = *((const int2 *) (bq4->qs + 4*iqs) + 0);
+    const int2 qb = *((const int2 *) (bq4->qs + 4*iqs) + 1);
+    const int aux[4] = {qa.x, qa.y, qb.x, qb.y};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int2 v = get_int_from_table_16(aux[j], kvalues_iq4nl);
+        w.v[2*j + 0] = v.x;
+        w.v[2*j + 1] = v.y;
+    }
+    w.ls = (((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4)) - 32;
+    w.dx = __half2float(bq4->d);
+}
+static __device__ __forceinline__ float lp84_dot(const lp84_w & w, const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
+        sumi = ggml_cuda_dp4a(w.v[2*j + 0], u0, sumi);
+        sumi = ggml_cuda_dp4a(w.v[2*j + 1], u1, sumi);
+    }
+    sumi *= w.ls;
+    const float d = w.dx * __low2float(bq8_1[iqs/4].ds);
+    return d * sumi;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -845,6 +881,27 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
+        if constexpr (LP84 && type == GGML_TYPE_IQ4_XS && ncols_dst >= 2 && ncols_dst <= LP84_MAXN) {   // local patch 0084
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                lp84_w w;
+                lp84_load(vx, kbx_offset + i*stride_row_x + kbx, kqs, w);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += lp84_dot(w, &y[j*stride_col_y + kby], kqs);
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        lp84_w wg;
+                        lp84_load(vgate, kbx_offset + i*stride_row_x + kbx, kqs, wg);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += lp84_dot(wg, &y[j*stride_col_y + kby], kqs);
+                        }
+                    }
+                }
+            }
+        } else {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -858,6 +915,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+        }
         }
     }
 
