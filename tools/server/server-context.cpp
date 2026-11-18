@@ -338,6 +338,8 @@ static bool vllm_utf8_ok(const std::string & s) {
 struct server_slot {
     int id;
 
+    int64_t lab_ckpt_restored = -1;   // local patch 0093: n_tokens of the checkpoint restored for the current task
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
@@ -2843,6 +2845,25 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // local patch 0093: the slot was restored from a checkpoint at exactly this position and has processed nothing
+        // since -> the state equals that checkpoint; keep it instead of re-copying ~60-90 MiB of recurrent state
+        {
+            static const bool skip_restored = [] {
+                const char * e = getenv("LLAMA_CKPT_SKIP_RESTORED");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            if (skip_restored && slot.lab_ckpt_restored >= 0 && n_tokens_new == slot.lab_ckpt_restored) {
+                for (const auto & c : slot.prompt.checkpoints) {
+                    if (c->n_tokens == n_tokens_new) {
+                        slot.lab_ckpt_restored = -1;
+                        return;
+                    }
+                }
+            }
+            slot.lab_ckpt_restored = -1;
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -4880,6 +4901,7 @@ private:
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
+                            slot.lab_ckpt_restored = -1;   // local patch 0093
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -4948,6 +4970,7 @@ private:
                                     } else {
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
+                                        slot.lab_ckpt_restored = cur.n_tokens;   // local patch 0093
 
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
                                     }
@@ -5172,7 +5195,14 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            // local patch 0093: a last user message that starts within LLAMA_CKPT_USER_MIN_GAP tokens of the
+                            // prompt end needs no own checkpoint: the end-4 checkpoint follows a few tokens later
+                            static const int64_t user_min_gap = [] {
+                                const char * e = getenv("LLAMA_CKPT_USER_MIN_GAP");
+                                return e != nullptr ? (int64_t) atoll(e) : (int64_t) 64;
+                            }();
+                            const bool near_end_user = user_min_gap > 0 && (int64_t) slot.task->n_tokens() - (int64_t) pos <= user_min_gap;
+                            if (!near_end_user && (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }
