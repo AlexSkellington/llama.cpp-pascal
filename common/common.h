@@ -2,6 +2,11 @@
 
 #pragma once
 
+#if defined(__linux__)
+#include <sys/mman.h>   // local patch 0092
+#include <cstdlib>
+#endif
+
 #include "llama-cpp.h"
 
 #include "ggml-opt.h"
@@ -1333,6 +1338,29 @@ struct common_no_init_allocator : std::allocator<T> {
     template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
 
     template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+
+#if defined(__linux__)
+    // local patch 0092: big state buffers (context checkpoints) on 2 MiB-aligned memory with MADV_HUGEPAGE
+    T * allocate(std::size_t n) {
+        const size_t bytes = n * sizeof(T);
+        if (bytes >= ((size_t) 4 << 20)) {
+            void * p = nullptr;
+            if (posix_memalign(&p, (size_t) 2 << 20, bytes) == 0) {
+                madvise(p, bytes, MADV_HUGEPAGE);
+                return static_cast<T *>(p);
+            }
+        }
+        return std::allocator<T>::allocate(n);
+    }
+
+    void deallocate(T * p, std::size_t n) {
+        if (n * sizeof(T) >= ((size_t) 4 << 20)) {
+            free(p);
+            return;
+        }
+        std::allocator<T>::deallocate(p, n);
+    }
+#endif
 };
 
 // sequence state data, filled by llama_state_seq_get_data_ext()

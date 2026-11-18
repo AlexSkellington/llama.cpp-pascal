@@ -3657,6 +3657,63 @@ private:
     size_t size_written = 0;
 };
 
+// local patch 0092: pinned staging for host-side sequence state reads/writes (context checkpoints). A pageable
+// destination makes every device<->host copy a staged, blocking transfer (measured 57 ms per 63 MiB Qwen3.6 checkpoint
+// on the P5000 pair). One process-wide pinned buffer, grown in 64 MiB steps, used for states of 1..512 MiB.
+// LLAMA_STATE_PINNED=0 disables it.
+struct llama_state_stage {
+    ggml_backend_buffer_type_t buft = nullptr;
+    ggml_backend_buffer_t      buf  = nullptr;
+    size_t                     size = 0;
+
+    static bool enabled() {
+        static const bool en = [] {
+            const char * e = getenv("LLAMA_STATE_PINNED");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return en;
+    }
+
+    uint8_t * get(size_t n) {
+        if (!enabled() || buft == nullptr || n < ((size_t) 1 << 20) || n > ((size_t) 512 << 20)) {
+            return nullptr;
+        }
+        if (n > size) {
+            if (buf != nullptr) {
+                ggml_backend_buffer_free(buf);
+                buf  = nullptr;
+                size = 0;
+            }
+            const size_t step = (size_t) 64 << 20;
+            const size_t want = (n + step - 1) / step * step;
+            buf = ggml_backend_buft_alloc_buffer(buft, want);
+            if (buf == nullptr) {
+                return nullptr;
+            }
+            size = want;
+        }
+        return (uint8_t *) ggml_backend_buffer_get_base(buf);
+    }
+
+    ~llama_state_stage() {
+        if (buf != nullptr) {
+            ggml_backend_buffer_free(buf);
+        }
+    }
+};
+
+static llama_state_stage & llama_state_stage_get() {
+    static llama_state_stage stage;
+    return stage;
+}
+
+static void llama_state_stage_init(const llama_model & model) {
+    auto & st = llama_state_stage_get();
+    if (st.buft == nullptr && !model.devices.empty()) {
+        st.buft = ggml_backend_dev_host_buffer_type(model.devices[0].dev);
+    }
+}
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
@@ -3684,6 +3741,18 @@ public:
         }
 
         std::vector<const ggml_tensor *> const_tensors(tensors.begin(), tensors.end());
+        size_t end = 0;   // local patch 0092
+        for (const auto & winfo : winfos) {
+            end = std::max(end, winfo.data_offset + winfo.size);
+        }
+        uint8_t * stage = llama_state_stage_get().get(end);
+        if (stage != nullptr) {
+            ggml_backend_tensor_get_n(const_tensors.data(), stage, offsets.data(), sizes.data(), data_offsets.data(), winfos.size());
+            for (const auto & winfo : winfos) {
+                memcpy(base_ptr + winfo.data_offset, stage + winfo.data_offset, winfo.size);
+            }
+            return;
+        }
         ggml_backend_tensor_get_n(const_tensors.data(), base_ptr, offsets.data(), sizes.data(), data_offsets.data(), winfos.size());
     }
 
@@ -3754,6 +3823,18 @@ public:
             data_offsets.push_back(rinfo.data_offset);
         }
 
+        size_t end = 0;   // local patch 0092
+        for (const auto & rinfo : rinfos) {
+            end = std::max(end, rinfo.data_offset + rinfo.size);
+        }
+        uint8_t * stage = llama_state_stage_get().get(end);
+        if (stage != nullptr) {
+            for (const auto & rinfo : rinfos) {
+                memcpy(stage + rinfo.data_offset, base_ptr + rinfo.data_offset, rinfo.size);
+            }
+            ggml_backend_tensor_set_n(tensors.data(), stage, offsets.data(), sizes.data(), data_offsets.data(), rinfos.size());
+            return;
+        }
         ggml_backend_tensor_set_n(tensors.data(), base_ptr, offsets.data(), sizes.data(), data_offsets.data(), rinfos.size());
     }
 
@@ -4217,6 +4298,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    llama_state_stage_init(model);   // local patch 0092
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -4236,6 +4318,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    llama_state_stage_init(model);   // local patch 0092
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
