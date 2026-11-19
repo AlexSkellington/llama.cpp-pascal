@@ -79,7 +79,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES=89-real \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ github.repository == 'AlexSkellington/llama.cpp-pascal' && '61-real' || '89-real' }} \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
@@ -99,6 +99,7 @@ jobs:
           save: true
 
   hip:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_NON_PASCAL_CI == 'true' }}
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:6.3.4
 

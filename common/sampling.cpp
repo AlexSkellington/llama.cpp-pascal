@@ -18,7 +18,7 @@
 #include <vector>
 
 // local patch 0015: AVX2 helper for the 0005 top-k prefilter (runtime-dispatched)
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
 #define LP0015_X86 1
 #include <immintrin.h>
 static bool lp0015_has_avx2() {

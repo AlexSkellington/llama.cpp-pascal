@@ -471,7 +471,8 @@ struct vllm_st_compiler {
             for (const auto & r : json_value(schema, "required", json::array())) { required.insert(r.get<std::string>()); }
             const std::string ws = "[ \\t\\n]*";
             std::vector<std::string> parts;
-            for (const auto & kv : json_value(schema, "properties", json::object()).items()) {
+            const json properties = json_value(schema, "properties", json::object());
+            for (const auto & kv : properties.items()) {
                 const json & ps = kv.value();
                 std::string val;
                 if (json_value(ps, "type", std::string()) == "string") {

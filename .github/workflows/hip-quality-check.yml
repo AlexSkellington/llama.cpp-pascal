@@ -44,6 +44,7 @@ env:
 
 jobs:
   ubuntu-22-hip-quality-check:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_NON_PASCAL_CI == 'true' }}
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:7.2.1
     steps:
