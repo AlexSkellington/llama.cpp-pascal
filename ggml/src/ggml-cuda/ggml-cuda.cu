@@ -4967,7 +4967,6 @@ static bool lp0018_try_group(ggml_backend_cuda_context * ctx, ggml_cgraph * grap
     return true;
 }
 
-bool lab_mmq_prefill_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second);
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<bool> & nodes_fused) {
 

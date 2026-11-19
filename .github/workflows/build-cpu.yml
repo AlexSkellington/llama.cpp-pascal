@@ -37,6 +37,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Match the upstream UI release used by the Pascal build.
+  HF_UI_VERSION: ${{ vars.LLAMA_CI_UI_VERSION || 'b12463' }}
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
   GGML_SCHED_DEBUG_REALLOC: 1
@@ -186,6 +188,26 @@ jobs:
         id: install_ninja
         run: |
           choco install ninja
+
+      - name: Install LLVM 22 for ARM64 cross-compilation
+        if: ${{ matrix.arch == 'arm64' }}
+        shell: pwsh
+        run: |
+          $version = '22.1.8'
+          $installer = Join-Path $env:RUNNER_TEMP 'llvm-installer.exe'
+          $prefix = Join-Path $env:RUNNER_TEMP "llvm-$version"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+          curl.exe --fail --location --retry 3 --output $installer $url
+          if ($LASTEXITCODE -ne 0) { throw "LLVM download failed" }
+          $expected = '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+          if ((Get-FileHash -Algorithm SHA256 $installer).Hash -ine $expected) {
+            throw "LLVM installer SHA-256 mismatch"
+          }
+          $setup = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$prefix") -Wait -PassThru -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw "LLVM installation failed: $($setup.ExitCode)" }
+          & (Join-Path $prefix 'bin/clang.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "LLVM verification failed" }
+          (Join-Path $prefix 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build
         id: cmake_build
