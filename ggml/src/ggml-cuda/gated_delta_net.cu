@@ -294,7 +294,7 @@ gdn49_prep(const float * q, const float * k, const float * v, const float * g, c
         }
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
-            const float y = __shfl_up_sync(0xffffffff, lg, o);
+            const float y = __shfl_up_sync(0xffffffffULL, lg, o);
             if (tid >= o) {
                 lg += y;
             }
@@ -506,19 +506,19 @@ gdn49_scan(const float * q, const float * k, const float * v, const float * g, c
         for (int i = 0; i < 16; ++i) {
             const float keep = b2 ? pq[i] : pw[i];
             const float send = b2 ? pw[i] : pq[i];
-            r1[i] = keep + __shfl_xor_sync(0xffffffff, send, 4, 8);
+            r1[i] = keep + __shfl_xor_sync(0xffffffffULL, send, 4, 8);
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float keep = b1 ? r1[8 + i] : r1[i];
             const float send = b1 ? r1[i] : r1[8 + i];
-            r2[i] = keep + __shfl_xor_sync(0xffffffff, send, 2, 8);
+            r2[i] = keep + __shfl_xor_sync(0xffffffffULL, send, 2, 8);
         }
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const float keep = b0 ? r2[4 + i] : r2[i];
             const float send = b0 ? r2[i] : r2[4 + i];
-            r3[i] = keep + __shfl_xor_sync(0xffffffff, send, 1, 8);
+            r3[i] = keep + __shfl_xor_sync(0xffffffffULL, send, 1, 8);
         }
         {
             const int tq = (b1 ? 8 : 0) + (b0 ? 4 : 0);
