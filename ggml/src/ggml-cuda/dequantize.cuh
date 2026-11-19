@@ -43,6 +43,47 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+static __device__ __forceinline__ void dequantize_q8_k(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const auto & x = static_cast<const block_q8_K *>(vx)[ib];
+    v = make_float2(x.d*x.qs[iqs], x.d*x.qs[iqs+1]);
+}
+
+static __device__ __forceinline__ int ternary_tq1(const block_tq1_0 & x, const int i) {
+    constexpr int powers[] = {1, 3, 9, 27, 81};
+    uint8_t packed;
+    int trit;
+    if (i < 160) {
+        packed = x.qs[i % 32];
+        trit = i / 32;
+    } else if (i < 240) {
+        packed = x.qs[32 + (i-160) % 16];
+        trit = (i-160) / 16;
+    } else {
+        packed = x.qh[(i-240) % 4];
+        trit = (i-240) / 4;
+    }
+    return ((int(uint8_t(packed*powers[trit]))*3) >> 8) - 1;
+}
+
+static __device__ __forceinline__ void dequantize_tq1_0(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const auto & x = static_cast<const block_tq1_0 *>(vx)[ib];
+    const float d = __half2float(x.d);
+    v = make_float2(d*ternary_tq1(x, iqs), d*ternary_tq1(x, iqs+1));
+}
+
+static __device__ __forceinline__ int ternary_tq2(const block_tq2_0 & x, const int i) {
+    return ((x.qs[(i/128)*32 + i%32] >> (2*((i/32)%4))) & 3) - 1;
+}
+
+static __device__ __forceinline__ void dequantize_tq2_0(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const auto & x = static_cast<const block_tq2_0 *>(vx)[ib];
+    const float d = __half2float(x.d);
+    v = make_float2(d*ternary_tq2(x, iqs), d*ternary_tq2(x, iqs+1));
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

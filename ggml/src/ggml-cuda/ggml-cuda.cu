@@ -7115,7 +7115,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
-                    case GGML_TYPE_Q8_K:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ2_S:
@@ -7127,6 +7126,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_Q8_K:
+                    case GGML_TYPE_TQ1_0:
+                    case GGML_TYPE_TQ2_0:
+                        return ggml_cuda_weight_unpack_pascal(a->type, cc_dev) && b->type == GGML_TYPE_F32;
                     default:
                         return false;
                 }
@@ -7241,6 +7244,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_Q5_1 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src1_type == GGML_TYPE_F32 &&
+                        ggml_cuda_weight_unpack_pascal(src0_type, ggml_cuda_info().devices[dev_ctx->device].cc) &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
