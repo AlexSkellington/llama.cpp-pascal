@@ -46,6 +46,7 @@ env:
 
 jobs:
   cpu-x64-high-perf:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: hf-jobs-cpu-upgrade:ubuntu26_04
 
     # note: this runner has 8 CPUs, but std::thread::hardware_concurrency reports the cores of the
@@ -96,6 +97,7 @@ jobs:
           save: true
 
   cpu-arm64-high-perf-graviton4:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:

@@ -49,7 +49,7 @@ env:
 
 jobs:
   gpu-cuda:
-    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_GPU_CI == 'true' }}
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: "hf-jobs-t4-medium:cuda13"
 
     steps:
@@ -94,7 +94,7 @@ jobs:
           save: true
 
   gpu-rocm:
-    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_GPU_CI == 'true' }}
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     strategy:
       fail-fast: false
       matrix:

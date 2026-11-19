@@ -150,7 +150,7 @@ jobs:
           save: true
 
   musa:
-    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_GPU_CI == 'true' }}
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/musa_sdk:5.2.0-devel-ubuntu22.04-s5000
 
