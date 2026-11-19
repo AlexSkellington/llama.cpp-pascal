@@ -1999,6 +1999,33 @@ static bool lp71_v_aligned(const ggml_tensor * V) {
     return V->nb[1] % (V->type == GGML_TYPE_Q4_0 ? sizeof(block_q4_0) : sizeof(block_q8_0)) == 0;
 }
 
+static bool lp27_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_LP0027");
+        return !e || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// The allocator and launcher must agree when the DP4A prefill path reads packed Q8
+// K/V directly. Its separately allocated packed tiles do not use F16 conversion buffers.
+static bool lp27_prefill_eligible(const ggml_tensor * dst, const int cc) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const bool alias = V->view_src &&
+        (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    float bias, softcap;
+    memcpy(&bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    return lp27_enabled() && cc == 610 &&
+        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] >= 128 && K->ne[1] >= 1024 &&
+        K->type == GGML_TYPE_Q8_0 && lp71_v_ok(V) &&
+        K->nb[1] % sizeof(block_q8_0) == 0 && lp71_v_aligned(V) &&
+        !alias && bias == 0.0f && softcap == 0.0f && !dst->src[4] && !dst->src[5];
+}
+
 static bool ggml_cuda_fattn_tile_fused_q8(const ggml_tensor * dst, const int cc) {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_TILE_FUSED_Q8");
@@ -2173,12 +2200,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     // LP_DP4A_PREFILL (local patch 0027): default ON, GGML_CUDA_LP0027=0 disables; decode/vision paths unchanged.
     if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap && ncols2 <= 8) {
-        static const bool enabled=[] { const char *e=getenv("GGML_CUDA_LP0027"); return !(e && atoi(e)==0); }();
+        const bool enabled = lp27_enabled();
         const ggml_tensor *K=dst->src[1], *V=dst->src[2];
         const bool alias=V->view_src && (V->view_src==K || (V->view_src==K->view_src && V->view_offs==K->view_offs));
         float bias=0.0f; memcpy(&bias,(const float *)dst->op_params+1,sizeof(float));
-        if (enabled && cc==610 && Q->ne[1]>=128 && K->ne[1]>=1024 && K->type==GGML_TYPE_Q8_0 && lp71_v_ok(V) &&
-            K->nb[1]%sizeof(block_q8_0)==0 && lp71_v_aligned(V) && !alias && bias==0.0f && !dst->src[4]) {
+        if (lp27_prefill_eligible(dst, cc)) {
             static thread_local unsigned logged=0;
             if (getenv("GGML_CUDA_LP0027_TRACE") && logged++<4) GGML_LOG_WARN("LP_DP4A_PREFILL gpu=%d q=%lld kv=%lld group=%d K=q8 V=f16 Q=block32int8 softmax=f32\n", id,(long long)Q->ne[1],(long long)K->ne[1],ncols2);
             { // local patch 0050: V re-quantized per (32-key tile, dim) and transposed once per call; P.V runs in DP4A
