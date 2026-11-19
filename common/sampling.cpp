@@ -263,8 +263,8 @@ struct common_sampler {
 
     mutable int64_t t_total_us = 0;
 
-    std::vector<float>   topk_heap; // local patch 0005 scratch
-    std::vector<int32_t> topk_cand; // local patch 0005 v2 scratch
+    std::vector<float>   topk_heap{}; // local patch 0005 scratch
+    std::vector<int32_t> topk_cand{}; // local patch 0005 v2 scratch
 };
 
 std::string common_params_sampling::print() const {
