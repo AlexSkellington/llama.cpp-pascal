@@ -1,0 +1,23 @@
+name: Pascal Windows LLVM
+description: Install the LLVM version supported by the Windows runner STL
+runs:
+  using: composite
+  steps:
+    - name: Install LLVM 22
+      shell: pwsh
+      run: |
+        $version = '22.1.8'
+        $installer = Join-Path $env:RUNNER_TEMP 'llvm-installer.exe'
+        $prefix = Join-Path $env:RUNNER_TEMP "llvm-$version"
+        $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+        curl.exe --fail --location --retry 3 --output $installer $url
+        if ($LASTEXITCODE -ne 0) { throw "LLVM download failed" }
+        $expected = '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+        if ((Get-FileHash -Algorithm SHA256 $installer).Hash -ine $expected) {
+          throw "LLVM installer SHA-256 mismatch"
+        }
+        $setup = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$prefix") -Wait -PassThru -WindowStyle Hidden
+        if ($setup.ExitCode -ne 0) { throw "LLVM installation failed: $($setup.ExitCode)" }
+        & (Join-Path $prefix 'bin/clang.exe') --version
+        if ($LASTEXITCODE -ne 0) { throw "LLVM verification failed" }
+        (Join-Path $prefix 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append

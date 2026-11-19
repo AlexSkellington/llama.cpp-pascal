@@ -177,6 +177,9 @@ jobs:
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
+      - name: Install LLVM 22
+        uses: ./.github/actions/pascal-windows-llvm
+
       - name: Build
         id: cmake_build
         shell: cmd
