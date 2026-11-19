@@ -44,6 +44,7 @@ env:
 
 jobs:
   ubuntu-26-s390x:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     name: ubuntu-26-s390x (VXE ${{ matrix.vxe }})
     runs-on: ubuntu-26.04-s390x
 
@@ -109,6 +110,7 @@ jobs:
           ./tests/test-quantize-be.sh ./build/bin/llama-quantize ./build/bin/llama-perplexity 2>&1
 
   ubuntu-26-zdnn-s390x:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     name: ubuntu-26-zdnn-s390x
     runs-on: ubuntu-26.04-s390x
 
@@ -138,6 +140,7 @@ jobs:
           time cmake --build build --config Release -j $(nproc)
 
   ubuntu-24-ppc64le:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: ubuntu-24.04-ppc64le
 
     steps:
