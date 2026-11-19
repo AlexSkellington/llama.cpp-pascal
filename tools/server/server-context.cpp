@@ -2189,7 +2189,7 @@ private:
         if (slot.task->params.return_tokens || vllm.return_token_ids || !vllm.bad_words.empty() || vllm.rep_max > 0) {
             slot.generated_tokens.push_back(result.tok);
         }
-        const bool vllm_stop_ok = slot.stats.n_gen >= vllm.min_tokens; // vLLM: no stop before min_tokens
+        const bool vllm_stop_ok = slot.stats.n_gen >= static_cast<uint64_t>(vllm.min_tokens); // vLLM: no stop before min_tokens
         slot.has_next_token = true;
 
         // check if there is incomplete UTF-8 character at the end

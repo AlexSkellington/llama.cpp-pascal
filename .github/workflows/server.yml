@@ -48,6 +48,8 @@ permissions:
   contents: read
 
 env:
+  # Match the upstream UI release used by the Pascal build.
+  HF_UI_VERSION: ${{ vars.LLAMA_CI_UI_VERSION || 'b12463' }}
   LLAMA_ARG_LOG_COLORS: 1
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
@@ -174,6 +176,9 @@ jobs:
           key: server-windows-2025-x64
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Install LLVM 22
+        uses: ./.github/actions/pascal-windows-llvm
 
       - name: Build
         id: cmake_build

@@ -46,6 +46,7 @@ env:
 
 jobs:
   cpu-arm64-graviton4-kleidiai:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:

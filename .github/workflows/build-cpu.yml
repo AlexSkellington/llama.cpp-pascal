@@ -37,6 +37,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Match the upstream UI release used by the Pascal build.
+  HF_UI_VERSION: ${{ vars.LLAMA_CI_UI_VERSION || 'b12463' }}
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
   GGML_SCHED_DEBUG_REALLOC: 1
@@ -186,6 +188,9 @@ jobs:
         id: install_ninja
         run: |
           choco install ninja
+
+      - name: Install LLVM 22
+        uses: ./.github/actions/pascal-windows-llvm
 
       - name: Build
         id: cmake_build

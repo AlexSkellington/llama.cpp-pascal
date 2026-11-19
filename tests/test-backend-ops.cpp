@@ -13298,6 +13298,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
                                                         GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     }
+    // The Pascal allocator must cover the mid-query F16 fallback and the native Q8 prefill route.
+    for (int gqa : {6, 8}) {
+        for (int queries : {16, 64, 128}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {gqa, 1}, 2048, queries,
+                true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
     // local patch 0067: Qwen3.8 shape -- head 256, GQA 6, q8_0 K/V, decode / MTP verify, long KV (DP4A fold route)
     for (int nb : { 1, 2, 3, }) {
         for (int kv : { 4096, 8192, 8192 + 77, }) {

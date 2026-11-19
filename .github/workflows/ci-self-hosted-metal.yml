@@ -50,6 +50,7 @@ env:
 
 jobs:
   gpu-metal:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
 
     steps:

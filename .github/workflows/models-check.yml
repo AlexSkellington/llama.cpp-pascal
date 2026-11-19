@@ -50,6 +50,7 @@ env:
 
 jobs:
   cuda:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: "hf-jobs-t4-medium:cuda13"
 
     steps:
@@ -121,6 +122,7 @@ jobs:
           GGML_CUDA_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   metal:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
 
     steps:
@@ -166,6 +168,7 @@ jobs:
           GGML_METAL_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   rocm:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "rocm/dev-ubuntu-24.04:7.2.4-complete"
 
@@ -239,6 +242,7 @@ jobs:
           GGML_CUDA_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   vulkan-nvidia:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: "hf-jobs-t4-small:ubuntu26_04"
 
     steps:
@@ -311,6 +315,7 @@ jobs:
           ./build/bin/test-llama-archs -s 1
 
   vulkan-amd:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "ubuntu:26.04"
 
@@ -379,6 +384,7 @@ jobs:
           ./build/bin/test-llama-archs -s 1
 
   webgpu-nvidia:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: "hf-jobs-t4-small:ubuntu26_04"
 
     steps:

@@ -48,6 +48,7 @@ env:
 
 jobs:
   gpu-webgpu-nvidia:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: "hf-jobs-t4-small:ubuntu26_04"
 
     steps:
@@ -107,6 +108,7 @@ jobs:
           save: true
 
   gpu-webgpu-apple:
+    if: ${{ github.repository != 'AlexSkellington/llama.cpp-pascal' || vars.LLAMA_ENABLE_EXTERNAL_CI == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
 
     steps:
