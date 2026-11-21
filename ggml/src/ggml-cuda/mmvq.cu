@@ -930,15 +930,29 @@ static __global__ void mul_mat_vec_q(
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
     [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DP4A
+    constexpr bool reduce_four_rows = ncols_dst == 3 && rows_per_cuda_block == 4 && nwarps > 1 && !has_fusion &&
+        type == GGML_TYPE_IQ4_XS;
+#else
+    constexpr bool reduce_four_rows = false;
+#endif
+    [[maybe_unused]] __shared__ float4 partials[reduce_four_rows ? nwarps - 1 : 1]
+                                              [reduce_four_rows ? ncols_dst : 1]
+                                              [reduce_four_rows ? warp_size : 1];
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
+            if constexpr (reduce_four_rows) {
+                partials[threadIdx.y - 1][j][threadIdx.x] = make_float4(
+                    tmp[j][0], tmp[j][1], tmp[j][2], tmp[j][3]);
+            } else {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                        }
                     }
                 }
             }
@@ -951,13 +965,23 @@ static __global__ void mul_mat_vec_q(
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
-    // sum up partial sums and write back result
+    // Sum each output row in the original warp order.
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
+        if constexpr (reduce_four_rows) {
+#pragma unroll
+            for (int l = 0; l < nwarps - 1; ++l) {
+                const float4 partial = partials[l][j][threadIdx.x];
+                tmp[j][0] += partial.x;
+                tmp[j][1] += partial.y;
+                tmp[j][2] += partial.z;
+                tmp[j][3] += partial.w;
+            }
+        }
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
+            for (int l = 0; l < (reduce_four_rows ? 0 : nwarps - 1); ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
                 if constexpr (has_fusion) {
                     if (use_gate) {
