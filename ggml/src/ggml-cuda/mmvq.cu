@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "convert.cuh"
 #if __has_include("lp83-knobs.h")
 #include "lp83-knobs.h"
 #endif
@@ -300,6 +301,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (ggml_cuda_weight_unpack_fallback(type)) {
+        return 0;
+    }
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         cc = ggml_cuda_highest_compiled_arch(cc);
@@ -334,7 +338,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    if (!ggml_is_quantized(type)) {
+    if (!ggml_is_quantized(type) || ggml_cuda_weight_unpack_fallback(type)) {
         return false;
     }
     // local patch 0063: measured on sm_61 (P5000, 2026-11-14); see apply0063.py

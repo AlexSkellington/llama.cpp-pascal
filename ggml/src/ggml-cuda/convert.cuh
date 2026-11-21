@@ -3,6 +3,16 @@
 
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 
+// These encodings can be unpacked for Pascal's FP32 GEMM fallback.
+// Native MMVQ/MMQ weight dispatch tables have no corresponding kernels.
+static inline bool ggml_cuda_weight_unpack_fallback(ggml_type type) {
+    return type == GGML_TYPE_Q8_K || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0;
+}
+
+static inline bool ggml_cuda_weight_unpack_pascal(ggml_type type, int cc) {
+    return cc == 610 && ggml_cuda_weight_unpack_fallback(type);
+}
+
 template<typename T>
 using to_t_cuda_t = void (*)(const void * x, T * y, int64_t k, cudaStream_t stream);
 
