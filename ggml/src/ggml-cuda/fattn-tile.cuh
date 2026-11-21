@@ -2323,7 +2323,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                     }();
                     constexpr int group = ncols2 == 2 ? 6 : 8;
                     if (enabled && cc == GGML_CUDA_CC_DP4A && Q->ne[1] == 1024 &&
-                            Q->ne[2] == group*K->ne[2] && K->ne[1] >= 32768 && K->ne[1] <= 131072 &&
+                            Q->ne[2] == group*K->ne[2] && K->ne[1] >= 32768 && K->ne[1] <= 262144 &&
                             K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
                         kernel = lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false,false,true>;
                     }
