@@ -1325,9 +1325,9 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     // KQ_cs == KQ chunk size, number of KQ values in j direction to store as one contiguous chunk in memory.
     // KQ is originally 2D but uses a Z-shaped 3D memory pattern like KQ[ncols/KQ_cs][DVp][KQ_cs].
 #ifdef FAST_FP16_AVAILABLE
-    constexpr int KQ_cs = cpw < 2*cpy_ne ? cpw : 2*cpy_ne;
+    constexpr int KQ_cs = cpw == 3 ? 1 : cpw < 2*cpy_ne ? cpw : 2*cpy_ne;
 #else
-    constexpr int KQ_cs = cpw < 1*cpy_ne ? cpw : 1*cpy_ne;
+    constexpr int KQ_cs = cpw == 3 ? 1 : cpw < 1*cpy_ne ? cpw : 1*cpy_ne;
 #endif // FAST_FP16_AVAILABLE
     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
@@ -1342,7 +1342,8 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
 
 
     // LP_DP4A_PREFILL: load packed Q8 keys cooperatively, transposed in shared memory.
-    static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1, "prototype layout"); // 0067: fold_gqa allowed
+    static_assert(DKQ == 256 && DV == 256 && (ncols == 32 || (kv_q8 && (ncols == 8 || ncols == 16 || ncols == 24))) && np == 1,
+        "unsupported DP4A attention geometry");
     constexpr int words = DKQ/4;
     constexpr bool lp73 = LP73_ON && !kv_q8 && nbatch_fa == 32; // local patch 0073: K8T tile copy (prefill)
     constexpr int pitch = lp73 ? nbatch_fa : nbatch_fa+1;
@@ -1662,7 +1663,8 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8 = false, bool fold_gqa = false, bool v_q4 = false, bool dual_staging = false> // D == head size (v_q4: local patch 0071)
-__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), (kv_q8 && ncols2 == 8) ? 2 : 3) // local patch 0044
+__launch_bounds__(kv_q8 && ncols1*ncols2 < 32 ? (ncols1*ncols2 == 24 ? 256 : 128) : ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
+                  (kv_q8 && ncols2 == 8) ? 2 : 3) // local patch 0044
 static __global__ void lpdp4a_tile(
         const char * Q_ptr,
         const char * K_ptr,
@@ -1718,13 +1720,15 @@ static __global__ void lpdp4a_tile(
         return;
     }
 
-    static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
-
     constexpr int ncols     = ncols1*ncols2;
     constexpr int warp_size = 32;
-    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
-    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
-    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+    constexpr bool short_q8 = kv_q8 && ncols < 32;
+    static_assert(short_q8 || ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) != 0, "kernel config not defined");
+    constexpr int nwarps    = short_q8 ? (ncols == 24 ? 8 : 4) :
+        ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols) / warp_size;
+    constexpr int nbatch_fa = short_q8 ? 32 : ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols);
+    // Keep the packaged-K iteration at one warp and the FP32 value stage inside KV_tmp.
+    constexpr int nbatch_K  = short_q8 ? 64 : ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols);
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1789,7 +1793,8 @@ static __global__ void lpdp4a_tile(
     ggml_cuda_pdl_sync();
 
 
-    static_assert(DKQ == 256 && DV == 256 && ncols == 32 && np == 1, "prototype layout"); // 0067: fold_gqa allowed
+    static_assert(DKQ == 256 && DV == 256 && (ncols == 32 || (kv_q8 && (ncols == 8 || ncols == 16 || ncols == 24))) && np == 1,
+        "unsupported DP4A attention geometry");
     // A warp owns cpw query columns. Each 32-element block has its own F32 scale.
     // No FP16 query scale or probability/value accumulation is introduced.
 #pragma unroll
@@ -2105,6 +2110,47 @@ static bool lp0024_eligible(const ggml_tensor * dst, const int cc) {
         mask->nb[3] >= size_t(mask->ne[2])*mask->nb[2];
 }
 
+template <int q_columns, bool fold_gqa>
+static void ggml_cuda_fattn_pascal_q8_short(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    constexpr int warp_size = 32;
+    constexpr int nwarps = q_columns == 3 ? 8 : 4;
+    launch_fattn<256, q_columns, 8, fold_gqa>(ctx, dst,
+        lpdp4a_tile<256, 256, q_columns, 8, false, true, fold_gqa>, nwarps, 0, 32,
+        false, false, false, false, warp_size);
+}
+
+template <bool fold_gqa>
+static bool ggml_cuda_fattn_pascal_q8_try_short(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int cc) {
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * v = dst->src[2];
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_PASCAL_Q8_SHORT_TILES");
+        return !value || value[0] != '0';
+    }();
+    if (!enabled || cc != GGML_CUDA_CC_DP4A || k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 ||
+            k->ne[1] < 8192 || k->ne[1] % 32 != 0 || q->ne[1] < 1) {
+        return false;
+    }
+    if (q->ne[1] == 1) {
+        ggml_cuda_fattn_pascal_q8_short<1, fold_gqa>(ctx, dst);
+        return true;
+    }
+    if (q->ne[1] == 2) {
+        ggml_cuda_fattn_pascal_q8_short<2, fold_gqa>(ctx, dst);
+        return true;
+    }
+    static const bool verify_tiles = [] {
+        const char * value = getenv("GGML_CUDA_PASCAL_Q8_VERIFY_TILES");
+        return !value || value[0] != '0';
+    }();
+    if (verify_tiles && q->ne[1] == 3) {
+        ggml_cuda_fattn_pascal_q8_short<3, fold_gqa>(ctx, dst);
+        return true;
+    }
+    return false;
+}
+
 template <int ncols>
 static void lp0024_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int cc) {
     static_assert(ncols == 8 || ncols == 16 || ncols == 32, "invalid lp0024 tile");
@@ -2291,6 +2337,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             K->nb[1]%sizeof(block_q8_0)==0 && lp71_v_aligned(V) && !alias && bias==0.0f && !dst->src[4]) {
             static thread_local unsigned logged31=0;
             if (getenv("GGML_CUDA_LP0027_TRACE") && logged31++<4) GGML_LOG_WARN("LP0031_DP4A_DECODE gpu=%d q=%lld kv=%lld group=%d\n", id,(long long)Q->ne[1],(long long)K->ne[1],ncols2);
+            if constexpr (ncols2 == 8) {
+                if (Q->ne[2] / K->ne[2] == 8 && ggml_cuda_fattn_pascal_q8_try_short<false>(ctx, dst, cc)) {
+                    return;
+                }
+            }
             if (V->type==GGML_TYPE_Q4_0) { // local patch 0071
                 launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,true,false,true>,8,0,32,false,false,false,false,warp_size);
                 return;
@@ -2423,6 +2474,9 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
                 static thread_local unsigned logged67 = 0;
                 if (getenv("GGML_CUDA_LP0027_TRACE") && logged67++ < 4) {
                     GGML_LOG_WARN("LP0067_DP4A_GQA6 q=%lld kv=%lld\n", (long long) Q->ne[1], (long long) K->ne[1]);
+                }
+                if (ggml_cuda_fattn_pascal_q8_try_short<true>(ctx, dst, cc)) {
+                    return;
                 }
                 if (V67->type == GGML_TYPE_Q4_0) { // local patch 0071
                     launch_fattn<256, 4, 8, true>(ctx, dst, lpdp4a_tile<256, 256, 4, 8, false, true, true, true>, 8, 0, 32,
