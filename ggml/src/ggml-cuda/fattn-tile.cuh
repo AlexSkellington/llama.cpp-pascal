@@ -1335,7 +1335,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     float KQ_max_new[cpw];
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
-        KQ_max_new[jc0] = KQ_max[jc0];
+        KQ_max_new[jc0] = stage_values ? -INFINITY : KQ_max[jc0];
     }
 
     float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
@@ -1427,7 +1427,8 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
                 KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
                     slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
 
-                KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
+                const float score = KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0];
+                KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], stage_values ? score : score + FATTN_KQ_MAX_OFFSET);
             }
         }
 
@@ -1452,6 +1453,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
 
     constexpr bool lp50 = (!kv_q8 && DV == 256 && DVp == DV && np == 1 && nbatch_fa == 32 && cpw == 4 && warp_size == 32); // local patch 0050
     float P50[cpw];
+    float P50_max[cpw];
     // Calculate KQ softmax, write to shared KQ buffer, re-scale VKQ accumulators:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; jc0 += KQ_cs) {
@@ -1465,6 +1467,12 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         for (int jc1 = 0; jc1 < KQ_cs; ++jc1) {
             const int jc = jc0 + jc1;
 
+            if constexpr (stage_values) {
+                const float tile_max = KQ_max_new[jc];
+                KQ_max_new[jc] = fmaxf(KQ_max[jc], tile_max + FATTN_KQ_MAX_OFFSET);
+                // Reuse the largest score with the same exponent as each probability.
+                P50_max[jc] = expf(tile_max - KQ_max_new[jc]);
+            }
             const float KQ_max_scale = expf(KQ_max[jc] - KQ_max_new[jc]);
             KQ_max[jc] = KQ_max_new[jc];
 
@@ -1525,7 +1533,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         float ps[cpw];
 #pragma unroll
         for (int jc = 0; jc < cpw; ++jc) {
-            const float m = warp_reduce_max<warp_size>(P50[jc]);
+            const float m = stage_values ? P50_max[jc] : warp_reduce_max<warp_size>(P50[jc]);
             ps[jc] = m*(1.0f/127.0f);
             const int q = m > 0.0f ? __float2int_rn(P50[jc]*(127.0f/m)) : 0;
             const int v0 = q & 0xFF;
