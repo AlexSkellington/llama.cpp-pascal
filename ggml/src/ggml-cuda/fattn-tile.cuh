@@ -1288,7 +1288,7 @@ static __global__ void flash_attn_tile(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, bool kv_q8, bool fold_gqa, bool v_q4, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, bool kv_q8, bool fold_gqa, bool v_q4, bool dual_staging, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void lpdp4a_tile_iter(
         T_vec_dot * const Q_tmp,
         const void  * const __restrict__ K_h2,
@@ -1308,6 +1308,11 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         const int k_VKQ_0,
         const int k_VKQ_max,
         const int col_Q_0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DP4A
+    constexpr bool stage_values = dual_staging;
+#else
+    constexpr bool stage_values = false;
+#endif
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -1343,6 +1348,12 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     constexpr int pitch = lp73 ? nbatch_fa : nbatch_fa+1;
     int * const packed_K = (int *) KV_tmp;
     const block_q8_0 * const keys = (const block_q8_0 *) K_h2;
+    static_assert(!stage_values || (lp73 && DV == 256 && cpw == 4 && np == 1));
+    int4 * staged_V = nullptr;
+    if constexpr (stage_values) {
+        __shared__ int4 value_tile[(nbatch_fa/4 + 1)*DV/4];
+        staged_V = value_tile;
+    }
     if constexpr (lp73) {
         constexpr int tile_i4 = (words*nbatch_fa + (DKQ/32)*nbatch_fa)/4;
         const int4 * const src = (const int4 *) ((const int *) K_h2 + int64_t(k_VKQ_0/nbatch_fa)*(tile_i4*4));
@@ -1383,6 +1394,13 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
             KQ_acc[col] += float(sums[col])*(kd*qd);
         }
     }
+    if constexpr (stage_values) {
+        constexpr int values_per_tile = (nbatch_fa/4 + 1)*DV;
+        const int4 * const value_src = (const int4 *) ((const int *) V_h2 + int64_t(k_VKQ_0/nbatch_fa)*values_per_tile);
+        for (int e = threadIdx.y*warp_size + threadIdx.x; e < values_per_tile/4; e += nwarps*warp_size) {
+            staged_V[e] = value_src[e];
+        }
+    }
     // Apply logit softcap + mask, update KQ_max:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
@@ -1416,7 +1434,10 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     }
 
     if constexpr (np == 1) {
-        __syncthreads();
+        if constexpr (!stage_values) {
+            // The legacy V staging reuses the K buffer.
+            __syncthreads();
+        }
     } else {
         static_assert(cpw == 1, "bad cpw");
         __shared__ float KQ_max_new_shared[nwarps];
@@ -1488,12 +1509,15 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     // local patch 0050: DP4A P.V with P from registers and the pre-pass V8T tile (see apply0050.py)
     if constexpr (lp50) {
         constexpr int nkg = nbatch_fa/4;                 // 8 groups of 4 keys
-        int   * const V8T = (int *) KV_tmp;              // [nkg][DV]
-        float * const Vsd = (float *) KV_tmp + nkg*DV;   // [DV]
-        const int tid = threadIdx.y*warp_size + threadIdx.x;
-        const int4 * src = (const int4 *) ((const int *) V_h2 + int64_t(k_VKQ_0/nbatch_fa)*(nkg*DV + DV));
-        for (int e = tid; e < (nkg*DV + DV)/4; e += nwarps*warp_size) {
-            ((int4 *) KV_tmp)[e] = src[e];
+        int4 * const V_tile = stage_values ? staged_V : (int4 *) KV_tmp;
+        int   * const V8T = (int *) V_tile;              // [nkg][DV]
+        float * const Vsd = (float *) V_tile + nkg*DV;    // [DV]
+        if constexpr (!stage_values) {
+            const int tid = threadIdx.y*warp_size + threadIdx.x;
+            const int4 * src = (const int4 *) ((const int *) V_h2 + int64_t(k_VKQ_0/nbatch_fa)*(nkg*DV + DV));
+            for (int e = tid; e < (nkg*DV + DV)/4; e += nwarps*warp_size) {
+                V_tile[e] = src[e];
+            }
         }
         // P (lane = key) -> int8 per (column, tile), packed 4 keys per int: lane 4*kg holds the pack of group kg
         int   pk[cpw];
@@ -1637,7 +1661,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8 = false, bool fold_gqa = false, bool v_q4 = false> // D == head size (v_q4: local patch 0071)
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8 = false, bool fold_gqa = false, bool v_q4 = false, bool dual_staging = false> // D == head size (v_q4: local patch 0071)
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), (kv_q8 && ncols2 == 8) ? 2 : 3) // local patch 0044
 static __global__ void lpdp4a_tile(
         const char * Q_ptr,
@@ -1795,14 +1819,14 @@ static __global__ void lpdp4a_tile(
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4>
+            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
-            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4>
+            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -1810,7 +1834,7 @@ static __global__ void lpdp4a_tile(
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
-            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4>
+            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -2236,7 +2260,22 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                 Kt.nb[3] = size_t(nhk*ntiles*2304)*sizeof(int);
                 dst->src[1] = &Kt;
 #endif
-                launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false>,8,0,32,false,false,false,false,warp_size);
+                auto kernel = lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false>;
+#if LP73_ON && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if constexpr (ncols2 == 2 || ncols2 == 8) {
+                    static const bool enabled = [] {
+                        const char * flag = getenv("GGML_CUDA_PASCAL_DUAL_KV_STAGING");
+                        return !(flag && strcmp(flag, "0") == 0);
+                    }();
+                    constexpr int group = ncols2 == 2 ? 6 : 8;
+                    if (enabled && cc == GGML_CUDA_CC_DP4A && Q->ne[1] == 1024 &&
+                            Q->ne[2] == group*K->ne[2] && K->ne[1] >= 32768 && K->ne[1] <= 131072 &&
+                            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
+                        kernel = lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false,false,true>;
+                    }
+                }
+#endif
+                launch_fattn<256,32/ncols2,ncols2>(ctx,dst,kernel,8,0,32,false,false,false,false,warp_size);
                 dst->src[1] = K_orig;
                 dst->src[2] = V_orig;
             }
