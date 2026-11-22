@@ -2,6 +2,9 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#ifndef LP114_ON
+#define LP114_ON 1 // local patch 0114: decode P.V in DP4A (symmetric V types)
+#endif
 #ifndef LP73_ON
 #define LP73_ON 1 // local patch 0073: K8T pre-pass for the 0027 prefill kernel
 #endif
@@ -1623,6 +1626,14 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     }
 
     constexpr bool lp50 = (!kv_q8 && DV == 256 && DVp == DV && np == 1 && nbatch_fa == 32 && cpw == 4 && warp_size == 32); // local patch 0050
+    // local patch 0114: decode P.V in DP4A for symmetric V types (legacy vt = -1: q8_0, or q4_0 with v_q4)
+    constexpr int vt_eff = vt >= 0 ? vt : (v_q4 ? int(GGML_TYPE_Q4_0) : int(GGML_TYPE_Q8_0));
+#ifdef FAST_FP16_AVAILABLE
+    constexpr bool lp114 = false;
+#else
+    constexpr bool lp114 = LP114_ON && kv_q8 && DV == 256 && DVp == DV && np == 1 && nbatch_fa == 32 && warp_size == 32 &&
+        !lp111_aff(vt_eff);
+#endif // FAST_FP16_AVAILABLE
     float P50[cpw];
     float P50_max[cpw];
     // Calculate KQ softmax, write to shared KQ buffer, re-scale VKQ accumulators:
@@ -1656,7 +1667,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
                 tmp[i0/(np*warp_size)][jc1] = val;
             }
             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
-            if constexpr (lp50) {
+            if constexpr (lp50 || lp114) {
                 P50[jc] = tmp[0][jc1];
             }
 
@@ -1676,7 +1687,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         }
 
 #pragma unroll
-        for (int i0 = 0; i0 < (lp50 ? 0 : nbatch_fa); i0 += np*warp_size) {
+        for (int i0 = 0; i0 < (lp50 || lp114 ? 0 : nbatch_fa); i0 += np*warp_size) {
             const int i = i0 + (threadIdx.y % np)*warp_size + threadIdx.x;
 
             ggml_cuda_memcpy_1<sizeof(tmp[0])>(
@@ -1752,6 +1763,97 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         __syncthreads();
         return;
     }
+    // local patch 0114: decode P.V in DP4A (see apply0114.py)
+#ifndef FAST_FP16_AVAILABLE
+    if constexpr (lp114) {
+        constexpr int nkg = nbatch_fa/4;                      // 8 groups of 4 keys
+        constexpr int nvb = DV/32;                            // 8 V blocks per row
+        int   * const V8T = (int *) KV_tmp;                    // [nkg][DV]: int8 of keys 4kg..4kg+3 for one dim
+        float * const Vd  = (float *) KV_tmp + nkg*DV;         // [key][block] V scales
+        __shared__ int P8s[ncols*nvb*nkg];                     // [column][block][key group]: int8 of 4 keys
+        const int tid = threadIdx.y*warp_size + threadIdx.x;
+        for (int it = tid; it < nkg*(DV/4); it += nwarps*warp_size) {
+            const int kg = it / (DV/4), w = it % (DV/4), blk = w/8, wb = w%8;
+            int x[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int k = 4*kg + r;
+                x[r] = 0;
+                if (!oob_check || k < k_VKQ_sup) {
+                    const char * vb = (const char *) V_h2 + (int64_t(k_VKQ_0 + k)*stride_V2 + blk)*lp111_bsz(vt_eff);
+                    x[r] = lp111_word<vt_eff>(vb, wb);
+                    if (wb == 0) {
+                        Vd[k*nvb + blk] = lp111_dm<vt_eff>(vb).x;
+                    }
+                } else if (wb == 0) {
+                    Vd[k*nvb + blk] = 0.0f;
+                }
+            }
+            // 4x4 byte transpose: out_i = byte i of x[0..3] (one dim, four keys)
+            const int t0 = __byte_perm(x[0], x[1], 0x5140), t1 = __byte_perm(x[2], x[3], 0x5140);
+            const int t2 = __byte_perm(x[0], x[1], 0x7362), t3 = __byte_perm(x[2], x[3], 0x7362);
+            *(int4 *) (V8T + kg*DV + 4*w) = make_int4(__byte_perm(t0, t1, 0x5410), __byte_perm(t0, t1, 0x7632),
+                                                      __byte_perm(t2, t3, 0x5410), __byte_perm(t2, t3, 0x7632));
+        }
+        __syncthreads();
+        // per-tile bound of |d_v| per block (each warp computes it, lane = key)
+        float vdm[nvb];
+#pragma unroll
+        for (int b = 0; b < nvb; ++b) {
+            vdm[b] = warp_reduce_max<warp_size>(fabsf(Vd[threadIdx.x*nvb + b]));
+        }
+        // P (lane = key) -> int8 per (column, block) with the V scale folded in; scale = max P * vdm[b] / 127
+        float pm[cpw];
+#pragma unroll
+        for (int jc = 0; jc < cpw; ++jc) {
+            const int jcb = jc + threadIdx.y*cpw;
+            pm[jc] = warp_reduce_max<warp_size>(P50[jc]);
+            int8_t * const P8b = (int8_t *) (P8s + jcb*nvb*nkg);
+#pragma unroll
+            for (int b = 0; b < nvb; ++b) {
+                const float den = pm[jc]*vdm[b];
+                const int q = den > 0.0f ? __float2int_rn(P50[jc]*Vd[threadIdx.x*nvb + b]*(127.0f/den)) : 0;
+                P8b[b*nbatch_fa + threadIdx.x] = int8_t(max(-127, min(127, q)));
+            }
+        }
+        __syncwarp();
+        int acc[DV/64][cpw][2];
+#pragma unroll
+        for (int i = 0; i < DV/64; ++i) {
+#pragma unroll
+            for (int jc = 0; jc < cpw; ++jc) {
+                acc[i][jc][0] = 0;
+                acc[i][jc][1] = 0;
+            }
+        }
+        const int bhalf = threadIdx.x >> 4;                   // dims 64i+2lane, +1 lie in block 2i + (lane >= 16)
+#pragma unroll
+        for (int kg = 0; kg < nkg; ++kg) {
+#pragma unroll
+            for (int i = 0; i < DV/64; ++i) {
+                const int2 v = *(const int2 *) (V8T + kg*DV + 64*i + 2*threadIdx.x);
+#pragma unroll
+                for (int jc = 0; jc < cpw; ++jc) {
+                    const int pk = P8s[((jc + threadIdx.y*cpw)*nvb + 2*i + bhalf)*nkg + kg];
+                    acc[i][jc][0] = ggml_cuda_dp4a(pk, v.x, acc[i][jc][0]);
+                    acc[i][jc][1] = ggml_cuda_dp4a(pk, v.y, acc[i][jc][1]);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < DV/64; ++i) {
+            const float vb = bhalf ? vdm[2*i + 1] : vdm[2*i];
+#pragma unroll
+            for (int jc = 0; jc < cpw; ++jc) {
+                const float sc = pm[jc]*vb*(1.0f/127.0f);
+                VKQ[jc*((DVp/2)/warp_size) + i].x += sc*float(acc[i][jc][0]);
+                VKQ[jc*((DVp/2)/warp_size) + i].y += sc*float(acc[i][jc][1]);
+            }
+        }
+        __syncthreads();
+        return;
+    }
+#endif // FAST_FP16_AVAILABLE
     // VKQ = V @ KQ matrix multiplication:
     static_assert(DV <= DKQ, "bad DV");
     static_assert(DV % nbatch_K == 0 || (nbatch_K % 3 == 0 && DV % (nbatch_K*2/3) == 0), "bad nbatch_K");
