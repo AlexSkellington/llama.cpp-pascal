@@ -1,0 +1,8 @@
+// local patch 0111: Pascal DP4A FlashAttention decode kernels for K = q8_0 (one TU per K type: parallel build)
+
+#include "../fattn-tile.cuh"
+
+LP111_DECL(GGML_TYPE_Q8_0, GGML_TYPE_Q4_1);
+LP111_DECL(GGML_TYPE_Q8_0, GGML_TYPE_Q5_0);
+LP111_DECL(GGML_TYPE_Q8_0, GGML_TYPE_Q5_1);
+LP111_DECL(GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL);

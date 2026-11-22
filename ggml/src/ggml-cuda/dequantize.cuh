@@ -119,6 +119,15 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// local patch 0111: iq4_nl element pair (iqs, iqs + 16) for dequantize_block_cuda (FlashAttention F16 copies of an iq4_nl KV cache)
+static __device__ __forceinline__ void dequantize_iq4_nl_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_iq4_nl & block = ((const block_iq4_nl *) vx)[ib];
+    const float d = __half2float(block.d);
+    const uint8_t q = block.qs[iqs];
+    v.x = d*kvalues_iq4nl[q & 15];
+    v.y = d*kvalues_iq4nl[q >> 4];
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the
