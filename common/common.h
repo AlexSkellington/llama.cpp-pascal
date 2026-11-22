@@ -510,6 +510,7 @@ struct common_params {
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
     float   fit_params_util    = 0.0f;  // local patch 0112: max fraction of each GPU's total memory (0 = free memory - margin only)
+    int32_t fit_params_slots   = -1;    // local patch 0113: max slots the KV planner may use (-1 = auto up to 8, 0 = keep --parallel)
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

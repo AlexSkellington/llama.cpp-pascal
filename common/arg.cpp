@@ -2965,6 +2965,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_UTIL"));
     add_opt(common_arg(
+        { "-fits", "--fit-slots" }, "N",
+        "local patch 0113: with the measured KV planner (-c 0, --fit on, tensor split or --fit-util), add slots while every slot "
+        "keeps >= 90% of the trained context, up to N slots (default: -1 = up to 8; 0 = keep --parallel)",
+        [](common_params & params, int value) {
+            params.fit_params_slots = value;
+        }
+    ).set_env("LLAMA_ARG_FIT_SLOTS"));
+    add_opt(common_arg(
         { "-fitc", "--fit-ctx" }, "N",
         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
         [](common_params & params, int value) {
