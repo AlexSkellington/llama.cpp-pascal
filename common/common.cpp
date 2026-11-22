@@ -1240,7 +1240,7 @@ static bool common_kv_plan_active(const common_params & params, const llama_mode
     return cparams.n_ctx == 0 && params.fit_params && (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR || params.fit_params_util > 0.0f);
 }
 
-static void common_kv_plan(common_params & params, llama_model * model, llama_context_params & cparams) {
+static void common_kv_plan(common_params & params, llama_model * model, llama_context_params & cparams, uint64_t * capacity = nullptr) {
     constexpr int64_t MiB = 1024*1024;
     // the GPUs that hold the model: --device if given, else every GPU
     std::vector<ggml_backend_dev_t> devs;
@@ -1344,6 +1344,9 @@ static void common_kv_plan(common_params & params, llama_model * model, llama_co
             j_lim  = j;
         }
     }
+    if (capacity) {
+        *capacity = n_best; // local patch 0113
+    }
     uint64_t n_ctx = std::min<uint64_t>(n_best, n_cap);
     n_ctx -= n_ctx % align;
     if (n_ctx < align) {
@@ -1393,6 +1396,49 @@ static void common_kv_plan(common_params & params, llama_model * model, llama_co
     LOG_INF("kv-plan: physical KV capacity %" PRIu64 " cells; model trained context %u x %u stream(s) = %" PRIu64 "; chosen n_ctx %" PRIu64
         " -> %" PRIu64 " cells per sequence (%u stream(s))%s",
         n_best, n_train, n_streams, n_cap, n_ctx, n_ctx / n_streams, n_streams, "\n");
+}
+
+// local patch 0113: add slots while every slot keeps >= 90 % of the trained context (see apply0113.py)
+static void common_kv_plan_slots(common_params & params, llama_model * model, llama_context_params & cparams, const uint64_t capacity) {
+    if (params.fit_params_slots == 0 || cparams.kv_unified || cparams.embeddings || cparams.n_ctx == 0 || capacity == 0) {
+        return;
+    }
+    const uint32_t n_train  = llama_model_n_ctx_train(model);
+    const double   min_frac = 0.9;
+    const uint32_t s0       = std::max<uint32_t>(1, cparams.n_seq_max);
+    const uint32_t s_cap    = params.fit_params_slots > 0 ? uint32_t(params.fit_params_slots) : 8u;
+    uint32_t s_try = (uint32_t) std::min<uint64_t>(s_cap, uint64_t(double(capacity) / (min_frac * n_train)));
+    if (s_try <= s0) {
+        LOG_INF("kv-plan: slots: %u (capacity %" PRIu64 " cells = %.2f x the trained context %u; another slot needs >= %.0f %% of it)%s",
+            s0, capacity, double(capacity) / n_train, n_train, 100.0*min_frac, "\n");
+        return;
+    }
+    for (; s_try > s0; --s_try) {
+        common_params        p = params;
+        llama_context_params c = cparams;
+        p.n_parallel = int32_t(s_try);
+        c.n_seq_max  = s_try;
+        c.n_ctx      = 0;
+        p.n_ctx      = 0;
+        if (params.n_outputs_max > 0) { // the server sizes output rows per slot (server_output_limits)
+            p.n_outputs_max = params.n_outputs_max / int32_t(s0) * int32_t(s_try);
+            c.n_outputs_max = uint32_t(p.n_outputs_max);
+        }
+        LOG_INF("kv-plan: slots: trying %u slots (capacity %" PRIu64 " cells at %u)%s", s_try, capacity, s0, "\n");
+        common_kv_plan(p, model, c, nullptr);
+        if (c.n_ctx != 0 && double(c.n_ctx) / s_try >= min_frac * n_train) {
+            params.n_parallel    = p.n_parallel;
+            params.n_ctx         = p.n_ctx;
+            params.n_outputs_max = p.n_outputs_max;
+            cparams.n_seq_max    = c.n_seq_max;
+            cparams.n_ctx        = c.n_ctx;
+            cparams.n_outputs_max = c.n_outputs_max;
+            LOG_INF("kv-plan: slots: %u -> %u, %u cells per slot (trained context %u)%s", s0, s_try, c.n_ctx / s_try, n_train, "\n");
+            return;
+        }
+        LOG_INF("kv-plan: slots: %u slots would get %u cells each (< %.0f %% of %u), not taken%s", s_try,
+            c.n_ctx ? c.n_ctx / s_try : 0u, 100.0*min_frac, n_train, "\n");
+    }
 }
 
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
@@ -1533,6 +1579,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
+    if (common_kv_plan_active(params, mparams, cparams)) {
+        uint64_t capacity = 0;
+        common_kv_plan(params, model, cparams, &capacity);          // local patch 0112
+        common_kv_plan_slots(params, model, cparams, capacity);     // local patch 0113 (may add slots)
+    }
+
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
@@ -1545,10 +1597,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
-    }
-
-    if (common_kv_plan_active(params, mparams, cparams)) {
-        common_kv_plan(params, model, cparams); // local patch 0112
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
