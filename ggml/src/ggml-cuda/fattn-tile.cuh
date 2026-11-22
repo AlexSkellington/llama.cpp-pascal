@@ -582,6 +582,124 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4(
     }
 }
 
+// local patch 0111: low-bit KV on the Pascal DP4A routes. Every supported cache type is decoded in the loaders into the
+// representation the Q8_0 kernels already use (signed int8 x4 words + one FP32 scale per 32-element block), so the tuned
+// tiles (0031 decode, short/verify tiles, 0067 GQA-6 fold, 0027/0073 prefill) run unchanged on top:
+//   q8_0 raw, q4_0 n-8, q5_0 n-16, iq4_nl int8 codebook: exact;
+//   q4_1 / q5_1 (d*n + m) as d*(n-8|16) + m' with m' = m + 8d|16d; the m' term is added through the per-block Q sum (exact).
+static constexpr __host__ __device__ int lp111_bsz(const int t) {
+    return t == GGML_TYPE_Q4_0 ? int(sizeof(block_q4_0)) : t == GGML_TYPE_Q4_1 ? int(sizeof(block_q4_1)) :
+           t == GGML_TYPE_Q5_0 ? int(sizeof(block_q5_0)) : t == GGML_TYPE_Q5_1 ? int(sizeof(block_q5_1)) :
+           t == GGML_TYPE_IQ4_NL ? int(sizeof(block_iq4_nl)) : int(sizeof(block_q8_0));
+}
+static constexpr __host__ __device__ bool lp111_aff(const int t) {
+    return t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_1;
+}
+static constexpr __host__ __device__ int lp111_qs_off(const int t) {   // byte offset of qs[] in the block
+    return t == GGML_TYPE_Q4_1 ? 4 : t == GGML_TYPE_Q5_0 ? 6 : t == GGML_TYPE_Q5_1 ? 8 : 2;
+}
+static constexpr __host__ __device__ int lp111_qh_off(const int t) {   // byte offset of qh (5th bits) in q5_0 / q5_1
+    return t == GGML_TYPE_Q5_1 ? 4 : 2;
+}
+static constexpr __host__ __device__ int lp111_center(const int t) {   // n - center = signed int8 value
+    return (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1) ? 8 : (t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1) ? 16 : 0;
+}
+
+// 32-bit read of a 2-byte aligned address (q8_0 / q4_0 / q5_0 / iq4_nl blocks are 34 / 18 / 22 / 18 bytes)
+static __device__ __forceinline__ uint32_t lp111_ld32(const char * p) {
+    const uint16_t * h = (const uint16_t *) p;
+    return uint32_t(__ldg(h)) | (uint32_t(__ldg(h + 1)) << 16);
+}
+
+// signed int8 x4 of elements 4w..4w+3 (w = 0..7) of one 32-element block
+template <int kt>
+static __device__ __forceinline__ int lp111_word(const char * blk, const int w) {
+    if constexpr (kt == GGML_TYPE_Q8_0) {
+        return int(lp111_ld32(blk + 2 + 4*w));
+    } else {
+        // nibble types: elements j < 16 = low nibble of qs[j], j >= 16 = high nibble of qs[j-16]
+        const uint32_t x = lp111_ld32(blk + lp111_qs_off(kt) + 4*(w & 3));
+        if constexpr (kt == GGML_TYPE_IQ4_NL) {
+            const int2 t = get_int_from_table_16(int(x), kvalues_iq4nl);
+            return w < 4 ? t.x : t.y;
+        } else {
+            uint32_t v = (x >> (4*(w >> 2))) & 0x0F0F0F0Fu;
+            if constexpr (kt == GGML_TYPE_Q5_0 || kt == GGML_TYPE_Q5_1) {
+                const uint32_t h = (lp111_ld32(blk + lp111_qh_off(kt)) >> (4*w)) & 0xFu;   // bit e = 5th bit of element e
+                v |= ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
+            }
+            // per byte n - center without borrows between bytes (n <= 31)
+            return int(((v | 0x80808080u) - uint32_t(lp111_center(kt))*0x01010101u) ^ 0x80808080u);
+        }
+    }
+}
+
+// (d, m') of one block: value = d*int8 + m'; m' = 0 for the symmetric types
+template <int kt>
+static __device__ __forceinline__ float2 lp111_dm(const char * blk) {
+    if constexpr (lp111_aff(kt)) {
+        const float2 dm = __half22float2(__ldg((const half2 *) blk));   // q4_1 / q5_1 blocks are 20 / 24 bytes: 4-byte aligned
+        return make_float2(dm.x, dm.y + float(lp111_center(kt))*dm.x);
+    } else {
+        return make_float2(__half2float(__ldg((const half *) blk)), 0.0f);
+    }
+}
+
+// element e of one block in FP32
+template <int kt>
+static __device__ __forceinline__ float lp111_elem(const char * blk, const int e) {
+    const float2 dm = lp111_dm<kt>(blk);
+    return dm.x*float(int8_t(lp111_word<kt>(blk, e/4) >> (8*(e%4)))) + dm.y;
+}
+
+// any supported type -> the FP32 tile layout of flash_attn_tile_load_tile_q8 (same work split: a quarter block = 8
+// elements = words 2q, 2q+1 per item); stride_KV is in blocks
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, int vt>
+static __device__ __forceinline__ void flash_attn_tile_load_tile_lp111(
+        const char * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
+    static_assert(J % 32 == 0, "bad J for a 32-element block type");
+    constexpr int row_bytes = (J + J_padding)*int(sizeof(float));
+    constexpr int st_nb = row_bytes % 16 == 0 ? 16 : (row_bytes % 8 == 0 ? 8 : 4);
+    constexpr int nblk     = J/32;
+    constexpr int items    = I*nblk*4;
+    constexpr int nthreads = nwarps*warp_size;
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int it0 = 0; it0 < items; it0 += nthreads) {
+        const int it = it0 + tid;
+        if (it0 + nthreads > items && it >= items) {
+            break;
+        }
+        const int q = it % 4;
+        const int b = (it / 4) % nblk;
+        const int i = it / (4*nblk);
+
+        __align__(16) float out[8];
+        if (!oob_check || i < i_sup) {
+            const char * blk = KV + (int64_t(i)*stride_KV + b)*lp111_bsz(vt);
+            const float2 dm = lp111_dm<vt>(blk);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int v = lp111_word<vt>(blk, 2*q + h);
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    out[4*h + l] = dm.x*float(int8_t(v >> (8*l))) + dm.y;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                out[l] = 0.0f;
+            }
+        }
+        float * dst = tile_KV + i*(J + J_padding) + b*32 + q*8;
+#pragma unroll
+        for (int l = 0; l < 8; l += st_nb/int(sizeof(float))) {
+            ggml_cuda_memcpy_1<st_nb>(dst + l, out + l);
+        }
+    }
+}
+
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
     bool use_logit_softcap, bool oob_check, bool kv_q8, typename T_vec_dot>
@@ -1288,7 +1406,7 @@ static __global__ void flash_attn_tile(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, bool kv_q8, bool fold_gqa, bool v_q4, bool dual_staging, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, bool kv_q8, bool fold_gqa, bool v_q4, bool dual_staging, int kt, int vt, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void lpdp4a_tile_iter(
         T_vec_dot * const Q_tmp,
         const void  * const __restrict__ K_h2,
@@ -1349,6 +1467,9 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     constexpr int pitch = lp73 ? nbatch_fa : nbatch_fa+1;
     int * const packed_K = (int *) KV_tmp;
     const block_q8_0 * const keys = (const block_q8_0 *) K_h2;
+    // local patch 0111: K type kt (prefill: the K8T layout, kt = Q4_1 marks the affine variant); Q_tmp column stride
+    constexpr bool k_aff = lp111_aff(kt);
+    constexpr int  qst   = words + (k_aff ? 2 : 1)*(DKQ/32);
     static_assert(!stage_values || (lp73 && DV == 256 && cpw == 4 && np == 1));
     int4 * staged_V = nullptr;
     if constexpr (stage_values) {
@@ -1356,12 +1477,12 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         staged_V = value_tile;
     }
     if constexpr (lp73) {
-        constexpr int tile_i4 = (words*nbatch_fa + (DKQ/32)*nbatch_fa)/4;
+        constexpr int tile_i4 = (words*nbatch_fa + (k_aff ? 2 : 1)*(DKQ/32)*nbatch_fa)/4; // 0111: + m' rows
         const int4 * const src = (const int4 *) ((const int *) K_h2 + int64_t(k_VKQ_0/nbatch_fa)*(tile_i4*4));
         for (int e = threadIdx.y*warp_size+threadIdx.x; e < tile_i4; e += nwarps*warp_size) {
             ((int4 *) KV_tmp)[e] = src[e];
         }
-    } else
+    } else if constexpr (kt == GGML_TYPE_Q8_0) {
     for (int t = threadIdx.y*warp_size+threadIdx.x; t < nbatch_fa*words; t += nwarps*warp_size) {
         const int row=t/words, word=t%words, block=word/8;
         int packed=0; float d=0.0f;
@@ -1373,6 +1494,25 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         packed_K[word*pitch+row]=packed;
         if (word%8 == 0) KV_tmp[(words+block)*pitch+row]=d;
     }
+    } else {
+        // local patch 0111: low-bit K decoded to the same int8 words + scales (+ m' rows for q4_1 / q5_1)
+        for (int t = threadIdx.y*warp_size+threadIdx.x; t < nbatch_fa*words; t += nwarps*warp_size) {
+            const int row=t/words, word=t%words, block=word/8;
+            int packed=0; float2 dm=make_float2(0.0f, 0.0f);
+            if (!oob_check || row < k_VKQ_sup) {
+                const char * key=(const char *) K_h2 + (int64_t(k_VKQ_0+row)*stride_K2+block)*lp111_bsz(kt);
+                packed=lp111_word<kt>(key, word%8);
+                if (word%8 == 0) dm=lp111_dm<kt>(key);
+            }
+            packed_K[word*pitch+row]=packed;
+            if (word%8 == 0) {
+                KV_tmp[(words+block)*pitch+row]=dm.x;
+                if constexpr (k_aff) {
+                    KV_tmp[(words+DKQ/32+block)*pitch+row]=dm.y;
+                }
+            }
+        }
+    }
     __syncthreads();
 #pragma unroll
     for (int block=0; block<DKQ/32; ++block) {
@@ -1383,16 +1523,23 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
 #pragma unroll
             for (int col=0; col<cpw; ++col) {
                 const int jc=col+threadIdx.y*cpw;
-                const int q=((const int *)Q_tmp)[jc*(words+DKQ/32)+block*8+word];
+                const int q=((const int *)Q_tmp)[jc*qst+block*8+word];
                 sums[col]=ggml_cuda_dp4a(k,q,sums[col]);
             }
         }
         const float kd=KV_tmp[(words+block)*pitch+threadIdx.x];
+        float km=0.0f;
+        if constexpr (k_aff) {
+            km=KV_tmp[(words+DKQ/32+block)*pitch+threadIdx.x];
+        }
 #pragma unroll
         for (int col=0; col<cpw; ++col) {
             const int jc=col+threadIdx.y*cpw;
-            const float qd=((const float *)Q_tmp)[jc*(words+DKQ/32)+words+block];
+            const float qd=((const float *)Q_tmp)[jc*qst+words+block];
             KQ_acc[col] += float(sums[col])*(kd*qd);
+            if constexpr (k_aff) { // local patch 0111: m' * (qd * sum of the block's int8 Q)
+                KQ_acc[col] += km*((const float *)Q_tmp)[jc*qst+words+DKQ/32+block];
+            }
         }
     }
     if constexpr (stage_values) {
@@ -1590,7 +1737,10 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
 #ifndef FAST_FP16_AVAILABLE
-        if constexpr (kv_q8 && v_q4) { // local patch 0071
+        if constexpr (kv_q8 && vt >= 0) { // local patch 0111: any supported V type
+            flash_attn_tile_load_tile_lp111<warp_size, nwarps, nbatch_V, DV, 0, oob_check, vt>
+                ((const char *) V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2*lp111_bsz(vt), KV_tmp, stride_V2, k_VKQ_sup - k0);
+        } else if constexpr (kv_q8 && v_q4) { // local patch 0071
             flash_attn_tile_load_tile_q4<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
                 ((const block_q4_0 *) V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
         } else if constexpr (kv_q8) {
@@ -1670,7 +1820,7 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8 = false, bool fold_gqa = false, bool v_q4 = false, bool dual_staging = false> // D == head size (v_q4: local patch 0071)
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8 = false, bool fold_gqa = false, bool v_q4 = false, bool dual_staging = false, int kt = GGML_TYPE_Q8_0, int vt = -1> // D == head size (v_q4: local patch 0071)
 __launch_bounds__(kv_q8 && ncols1*ncols2 < 32 ? (ncols1*ncols2 == 24 ? 256 : 128) : ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
                   (kv_q8 && ncols2 == 8) ? 2 : 3) // local patch 0044
 static __global__ void lpdp4a_tile(
@@ -1758,8 +1908,8 @@ static __global__ void lpdp4a_tile(
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
     // q8_0: strides in blocks, f16: strides in half2.
-    const int stride_K2 = nb11 / int(sizeof(block_q8_0));
-    const int stride_V2   = kv_q8 ? (v_q4 ? nb21 / int(sizeof(block_q4_0)) : nb21 / int(sizeof(block_q8_0))) : nb21 / int(sizeof(half2)); // 0071
+    const int stride_K2 = nb11 / lp111_bsz(kt); // local patch 0111 (q8_0: unchanged)
+    const int stride_V2   = kv_q8 ? (vt >= 0 ? nb21 / lp111_bsz(vt) : v_q4 ? nb21 / int(sizeof(block_q4_0)) : nb21 / int(sizeof(block_q8_0))) : nb21 / int(sizeof(half2)); // 0071
     const int stride_mask = nb31 / sizeof(half);
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
@@ -1785,8 +1935,8 @@ static __global__ void lpdp4a_tile(
     __shared__ half  KQ[ncols * nbatch_fa];
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #else
-    __shared__ float Q_tmp[ncols * (DKQ/4 + DKQ/32)];
-    __shared__ float KV_tmp[(DKQ/4+DKQ/32)*(nbatch_fa+1)];
+    __shared__ float Q_tmp[ncols * (DKQ/4 + (lp111_aff(kt) ? 2 : 1)*DKQ/32)];              // 0111: + Q sums
+    __shared__ float KV_tmp[(DKQ/4+(lp111_aff(kt) ? 2 : 1)*DKQ/32)*(nbatch_fa+1)];       // 0111: + m' rows
     __shared__ float KQ[ncols * nbatch_fa];
     __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #endif // FAST_FP16_AVAILABLE
@@ -1804,6 +1954,7 @@ static __global__ void lpdp4a_tile(
     static_assert(DKQ == 256 && DV == 256 && (ncols == 32 || (kv_q8 && (ncols == 8 || ncols == 16 || ncols == 24))) && np == 1,
         "unsupported DP4A attention geometry");
     // A warp owns cpw query columns. Each 32-element block has its own F32 scale.
+    constexpr int lp111_qst = DKQ/4 + (lp111_aff(kt) ? 2 : 1)*DKQ/32; // local patch 0111
     // No FP16 query scale or probability/value accumulation is introduced.
 #pragma unroll
     for (int col=0; col<cpw; ++col) {
@@ -1820,8 +1971,12 @@ static __global__ void lpdp4a_tile(
             const unsigned int q1=__shfl_sync(0xffffffffu,q0,(threadIdx.x&~3)+1);
             const unsigned int q2=__shfl_sync(0xffffffffu,q0,(threadIdx.x&~3)+2);
             const unsigned int q3=__shfl_sync(0xffffffffu,q0,(threadIdx.x&~3)+3);
-            if (threadIdx.x%4==0) ((int *)Q_tmp)[jc*(DKQ/4+DKQ/32)+block*8+threadIdx.x/4]=int(q0|(q1<<8)|(q2<<16)|(q3<<24));
-            if (threadIdx.x==0) Q_tmp[jc*(DKQ/4+DKQ/32)+DKQ/4+block]=d;
+            if (threadIdx.x%4==0) ((int *)Q_tmp)[jc*lp111_qst+block*8+threadIdx.x/4]=int(q0|(q1<<8)|(q2<<16)|(q3<<24));
+            if (threadIdx.x==0) Q_tmp[jc*lp111_qst+DKQ/4+block]=d;
+            if constexpr (lp111_aff(kt)) { // local patch 0111: d * (sum of the block's int8 Q) for the affine K offset
+                const float qsum=warp_reduce_sum<32>(float(qi));
+                if (threadIdx.x==0) Q_tmp[jc*lp111_qst+DKQ/4+DKQ/32+block]=d*qsum;
+            }
         }
     }
     __syncthreads();
@@ -1832,14 +1987,14 @@ static __global__ void lpdp4a_tile(
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging>
+            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging, kt, vt>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
-            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging>
+            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging, kt, vt>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -1847,7 +2002,7 @@ static __global__ void lpdp4a_tile(
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
-            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging>
+            lpdp4a_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, kv_q8, fold_gqa, v_q4, dual_staging, kt, vt>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -2190,6 +2345,206 @@ static void lp0024_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, co
 }
 
 
+// local patch 0111: low-bit KV pairs on the DP4A routes. GGML_CUDA_LP0111=0 disables (same-binary A/B).
+// The allocator (ggml_cuda_flash_attn_ext_get_alloc_size) and the launcher below MUST agree on these predicates.
+static bool lp111_enabled() {
+    static const bool e = [] { const char * s = getenv("GGML_CUDA_LP0111"); return !(s && atoi(s) == 0); }();
+    return e;
+}
+static bool lp111_type_ok(const ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+// head 256, a pair the legacy routes do not take (q8_0/q8_0 and q8_0/q4_0 keep their kernels), no ALiBi/softcap/sinks
+static bool lp111_common(const ggml_tensor * dst, const int cc) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!lp111_enabled() || cc != GGML_CUDA_CC_DP4A || !lp111_type_ok(K->type) || !lp111_type_ok(V->type) ||
+            (K->type == GGML_TYPE_Q8_0 && lp71_v_ok(V))) {
+        return false;
+    }
+    const bool alias = V->view_src &&
+        (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    float bias, softcap;
+    memcpy(&bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    return Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+        K->nb[1] % lp111_bsz(K->type) == 0 && V->nb[1] % lp111_bsz(V->type) == 0 &&
+        !alias && bias == 0.0f && softcap == 0.0f && !dst->src[4] && !dst->src[5];
+}
+// decode / MTP verify / short batches: 0031's gates (same environment knobs)
+static bool lp111_decode_eligible(const ggml_tensor * dst, const int cc) {
+    static const bool on31 = [] { const char * e = getenv("GGML_CUDA_LP0031"); return !(e && atoi(e) == 0); }();
+    static const long long min_kv31 = [] { const char * e = getenv("GGML_CUDA_LP0031_MIN_KV"); return e ? atoll(e) : -1LL; }();
+    static const long long max_q31 = [] { const char * e = getenv("GGML_CUDA_LP0031_MAX_TOKENS"); return e ? atoll(e) : 127LL; }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const long long gate = min_kv31 >= 0 ? min_kv31 : (Q->ne[1] >= 16 ? 1024LL : Q->ne[1] >= 4 ? 2048LL : 4096LL);
+    return on31 && lp27_enabled() && Q->ne[1] <= max_q31 && Q->ne[1] < 128 && K->ne[1] >= gate && K->ne[1] >= 1024 &&
+        lp111_common(dst, cc);
+}
+// prefill: 0027 kernel on the 0073 K8T / 0050 V8T pre-pass tiles
+static bool lp111_prefill_eligible(const ggml_tensor * dst, const int cc) {
+#if LP73_ON
+    return lp27_enabled() && dst->src[0]->ne[1] >= 128 && dst->src[1]->ne[1] >= 1024 && lp111_common(dst, cc);
+#else
+    GGML_UNUSED(dst); GGML_UNUSED(cc);
+    return false;
+#endif
+}
+// 0067's GQA-6 fold shape (lp0024_eligible without its q8_0 type checks)
+static bool lp111_fold_shape(const ggml_tensor * dst) {
+    static const bool on24 = [] { const char * e = getenv("GGML_CUDA_LP0024"); return !(e && strcmp(e, "0") == 0); }();
+    static const bool on67 = [] { const char * e = getenv("GGML_CUDA_LP0067"); return !(e && atoi(e) == 0); }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    return on24 && on67 && Q->type == GGML_TYPE_F32 && Q->ne[1] >= 1 && Q->ne[1] <= 5 && Q->ne[3] >= 1 &&
+        K->ne[1] > 0 && K->ne[1] == V->ne[1] && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        K->ne[2] > 0 && K->ne[2] == V->ne[2] && Q->ne[2] == 6*K->ne[2] &&
+        Q->ne[3] == K->ne[3] && K->ne[3] == V->ne[3] &&
+        mask && mask->type == GGML_TYPE_F16 && mask->ne[0] >= K->ne[1] &&
+        mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 && mask->ne[3] >= 1 &&
+        mask->nb[0] == sizeof(half) && mask->nb[1] >= size_t(mask->ne[0])*sizeof(half) &&
+        mask->nb[2] >= size_t(mask->ne[1])*mask->nb[1] &&
+        mask->nb[3] >= size_t(mask->ne[2])*mask->nb[2];
+}
+
+template <int kt, int vt, int q_columns, bool fold_gqa>
+static void lp111_short(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    constexpr int nwarps = q_columns == 3 ? 8 : 4;
+    launch_fattn<256, q_columns, 8, fold_gqa>(ctx, dst,
+        lpdp4a_tile<256, 256, q_columns, 8, false, true, fold_gqa, false, false, kt, vt>, nwarps, 0, 32,
+        false, false, false, false, 32);
+}
+
+// The decode kernels of one (K, V) pair. Instantiated in template-instances/fattn-tile-lp111-k*.cu (one TU per K type
+// for parallel compilation); declared extern below so the dispatching TU does not instantiate them again.
+template <int kt, int vt>
+void lp111_launch_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2, const bool fold) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    static const bool short_tiles = [] {
+        const char * value = getenv("GGML_CUDA_PASCAL_Q8_SHORT_TILES");
+        return !value || value[0] != '0';
+    }();
+    static const bool verify_tiles = [] {
+        const char * value = getenv("GGML_CUDA_PASCAL_Q8_VERIFY_TILES");
+        return !value || value[0] != '0';
+    }();
+    if (short_tiles && ncols2 == 8 && (fold || Q->ne[2] / K->ne[2] == 8) && K->ne[1] >= 8192 && K->ne[1] % 32 == 0) {
+        if (Q->ne[1] == 1) {
+            if (fold) { lp111_short<kt, vt, 1, true>(ctx, dst); } else { lp111_short<kt, vt, 1, false>(ctx, dst); }
+            return;
+        }
+        if (Q->ne[1] == 2) {
+            if (fold) { lp111_short<kt, vt, 2, true>(ctx, dst); } else { lp111_short<kt, vt, 2, false>(ctx, dst); }
+            return;
+        }
+        if (verify_tiles && Q->ne[1] == 3) {
+            if (fold) { lp111_short<kt, vt, 3, true>(ctx, dst); } else { lp111_short<kt, vt, 3, false>(ctx, dst); }
+            return;
+        }
+    }
+    if (fold) {
+        launch_fattn<256, 4, 8, true>(ctx, dst, lpdp4a_tile<256, 256, 4, 8, false, true, true, false, false, kt, vt>, 8, 0, 32,
+            false, false, false, false, 32);
+        return;
+    }
+    switch (ncols2) {
+        case 1:
+            launch_fattn<256, 32, 1>(ctx, dst, lpdp4a_tile<256, 256, 32, 1, false, true, false, false, false, kt, vt>, 8, 0, 32,
+                false, false, false, false, 32);
+            return;
+        case 2:
+            launch_fattn<256, 16, 2>(ctx, dst, lpdp4a_tile<256, 256, 16, 2, false, true, false, false, false, kt, vt>, 8, 0, 32,
+                false, false, false, false, 32);
+            return;
+        case 4:
+            launch_fattn<256, 8, 4>(ctx, dst, lpdp4a_tile<256, 256, 8, 4, false, true, false, false, false, kt, vt>, 8, 0, 32,
+                false, false, false, false, 32);
+            return;
+        case 8:
+            launch_fattn<256, 4, 8>(ctx, dst, lpdp4a_tile<256, 256, 4, 8, false, true, false, false, false, kt, vt>, 8, 0, 32,
+                false, false, false, false, 32);
+            return;
+        default:
+            break;
+    }
+    GGML_ABORT("lp111: unsupported ncols2 %d", ncols2);
+}
+
+#define LP111_DECL(kt, vt) \
+    template void lp111_launch_decode<kt, vt>(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2, const bool fold)
+
+#define LP111_DECL_K(kt)                    \
+    extern LP111_DECL(kt, GGML_TYPE_Q4_1);  \
+    extern LP111_DECL(kt, GGML_TYPE_Q5_0);  \
+    extern LP111_DECL(kt, GGML_TYPE_Q5_1);  \
+    extern LP111_DECL(kt, GGML_TYPE_IQ4_NL)
+LP111_DECL_K(GGML_TYPE_Q8_0);
+LP111_DECL_K(GGML_TYPE_Q4_0);
+LP111_DECL_K(GGML_TYPE_Q4_1);
+LP111_DECL_K(GGML_TYPE_Q5_0);
+LP111_DECL_K(GGML_TYPE_Q5_1);
+LP111_DECL_K(GGML_TYPE_IQ4_NL);
+#define LP111_DECL_K2(kt)                   \
+    extern LP111_DECL(kt, GGML_TYPE_Q8_0);  \
+    extern LP111_DECL(kt, GGML_TYPE_Q4_0)
+LP111_DECL_K2(GGML_TYPE_Q4_0);
+LP111_DECL_K2(GGML_TYPE_Q4_1);
+LP111_DECL_K2(GGML_TYPE_Q5_0);
+LP111_DECL_K2(GGML_TYPE_Q5_1);
+LP111_DECL_K2(GGML_TYPE_IQ4_NL);
+
+template <int kt>
+static void lp111_launch_decode_v(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2, const bool fold) {
+    switch (dst->src[2]->type) {
+        case GGML_TYPE_Q8_0:
+            if constexpr (kt != GGML_TYPE_Q8_0) { lp111_launch_decode<kt, GGML_TYPE_Q8_0>(ctx, dst, ncols2, fold); return; }
+            break;
+        case GGML_TYPE_Q4_0:
+            if constexpr (kt != GGML_TYPE_Q8_0) { lp111_launch_decode<kt, GGML_TYPE_Q4_0>(ctx, dst, ncols2, fold); return; }
+            break;
+        case GGML_TYPE_Q4_1:   lp111_launch_decode<kt, GGML_TYPE_Q4_1  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_Q5_0:   lp111_launch_decode<kt, GGML_TYPE_Q5_0  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_Q5_1:   lp111_launch_decode<kt, GGML_TYPE_Q5_1  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_IQ4_NL: lp111_launch_decode<kt, GGML_TYPE_IQ4_NL>(ctx, dst, ncols2, fold); return;
+        default: break;
+    }
+    GGML_ABORT("lp111: unexpected V type %s", ggml_type_name(dst->src[2]->type));
+}
+
+static void lp111_launch_decode_any(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2, const bool fold) {
+    static thread_local unsigned logged = 0;
+    if (getenv("GGML_CUDA_LP0027_TRACE") && logged++ < 4) {
+        GGML_LOG_WARN("LP0111_DP4A_DECODE q=%lld kv=%lld ncols2=%d fold=%d K=%s V=%s\n", (long long) dst->src[0]->ne[1],
+            (long long) dst->src[1]->ne[1], ncols2, int(fold), ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type));
+    }
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_Q8_0:   lp111_launch_decode_v<GGML_TYPE_Q8_0  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_Q4_0:   lp111_launch_decode_v<GGML_TYPE_Q4_0  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_Q4_1:   lp111_launch_decode_v<GGML_TYPE_Q4_1  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_Q5_0:   lp111_launch_decode_v<GGML_TYPE_Q5_0  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_Q5_1:   lp111_launch_decode_v<GGML_TYPE_Q5_1  >(ctx, dst, ncols2, fold); return;
+        case GGML_TYPE_IQ4_NL: lp111_launch_decode_v<GGML_TYPE_IQ4_NL>(ctx, dst, ncols2, fold); return;
+        default: break;
+    }
+    GGML_ABORT("lp111: unexpected K type %s", ggml_type_name(dst->src[1]->type));
+}
+
+
 // local patch 0073: per KV head and 32-key tile: K8T[word][key] (the q8_0 int8 values of 4 dims, unchanged) followed by
 // the q8_0 scales [block][key]; 2304 ints per tile = 0027's shared-memory K tile with pitch 32. Keys >= KV are zero.
 static __global__ void lp73_k8t(const char * __restrict__ K, const int64_t KV, const int64_t ntiles, const int64_t nh,
@@ -2258,6 +2613,99 @@ static __global__ void lp50_v8t(const char * __restrict__ V, const int64_t KV, c
         }
         ((float *) o)[NKG*DV + dim] = m*(1.0f/127.0f);
     }
+}
+
+// local patch 0111: 0073's K8T tile for every supported K type: [64 words][32 keys] signed int8 x4, [8 scales][32 keys]
+// and, for q4_1 / q5_1, [8 offsets m'][32 keys] (2560 ints per tile). Keys >= KV are zero.
+template <int kt>
+static __global__ void lp111_k8t(const char * __restrict__ K, const int64_t KV, const int64_t ntiles, const int64_t nh,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, int * __restrict__ out) {
+    constexpr int WORDS = 64, NB = 8, ROWS = WORDS + (lp111_aff(kt) ? 2 : 1)*NB;
+    const int64_t hs = blockIdx.y, seq = hs / nh, head = hs % nh;
+    const char * const kh = K + seq*nb3 + head*nb2;
+    for (int64_t e = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; e < ntiles*ROWS*32; e += int64_t(gridDim.x)*blockDim.x) {
+        const int64_t tile = e / (ROWS*32);
+        const int r = int(e % (ROWS*32)), row = r / 32, key = r % 32;
+        const int64_t k = tile*32 + key;
+        int v = 0;
+        if (k < KV) {
+            const int b = row < WORDS ? row/8 : (row - WORDS) % NB;
+            const char * blk = kh + k*nb1 + int64_t(b)*lp111_bsz(kt);
+            if (row < WORDS) {
+                v = lp111_word<kt>(blk, row % 8);
+            } else {
+                const float2 dm = lp111_dm<kt>(blk);
+                v = __float_as_int(row < WORDS + NB ? dm.x : dm.y);
+            }
+        }
+        out[(hs*ntiles + tile)*(ROWS*32) + r] = v;
+    }
+}
+
+// local patch 0111: 0050's V8T tile (int8 per (32-key tile, dim) + 256 scales, 2304 words) for every supported V type
+template <int vt>
+static __global__ void lp111_v8t(const char * __restrict__ V, const int64_t KV, const int64_t ntiles, const int64_t nh,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, int * __restrict__ out) {
+    constexpr int DV = 256, NKG = 8;
+    const int64_t hs = blockIdx.y, seq = hs / nh, head = hs % nh;
+    const char * const vh = V + seq*nb3 + head*nb2;
+    for (int64_t e = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; e < ntiles*DV; e += int64_t(gridDim.x)*blockDim.x) {
+        const int64_t tile = e / DV;
+        const int dim = int(e % DV), b = dim / 32, w = dim % 32;
+        float x[32];
+        float m = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int64_t k = tile*32 + j;
+            x[j] = k < KV ? lp111_elem<vt>(vh + k*nb1 + int64_t(b)*lp111_bsz(vt), w) : 0.0f;
+            m = fmaxf(m, fabsf(x[j]));
+        }
+        const float inv = m > 0.0f ? 127.0f/m : 0.0f;
+        int * const o = out + (hs*ntiles + tile)*(NKG*DV + DV);
+#pragma unroll
+        for (int kg = 0; kg < NKG; ++kg) {
+            int pkd = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                pkd |= (__float2int_rn(x[4*kg + j]*inv) & 0xFF) << (8*j);
+            }
+            o[kg*DV + dim] = pkd;
+        }
+        ((float *) o)[NKG*DV + dim] = m*(1.0f/127.0f);
+    }
+}
+
+static void lp111_k8t_launch(cudaStream_t st, const ggml_tensor * K, const int64_t ntiles, int * out) {
+    const int64_t nh = K->ne[2], ns = K->ne[3];
+    const int64_t nwork = ntiles*(lp111_aff(K->type) ? 80 : 72)*32;
+    const dim3 cg(unsigned((nwork + 255)/256 < 1024 ? (nwork + 255)/256 : 1024), unsigned(ns*nh));
+    const char * src = (const char *) K->data;
+    switch (K->type) {
+        case GGML_TYPE_Q8_0:   lp111_k8t<GGML_TYPE_Q8_0  ><<<cg, 256, 0, st>>>(src, K->ne[1], ntiles, nh, K->nb[1], K->nb[2], K->nb[3], out); break;
+        case GGML_TYPE_Q4_0:   lp111_k8t<GGML_TYPE_Q4_0  ><<<cg, 256, 0, st>>>(src, K->ne[1], ntiles, nh, K->nb[1], K->nb[2], K->nb[3], out); break;
+        case GGML_TYPE_Q4_1:   lp111_k8t<GGML_TYPE_Q4_1  ><<<cg, 256, 0, st>>>(src, K->ne[1], ntiles, nh, K->nb[1], K->nb[2], K->nb[3], out); break;
+        case GGML_TYPE_Q5_0:   lp111_k8t<GGML_TYPE_Q5_0  ><<<cg, 256, 0, st>>>(src, K->ne[1], ntiles, nh, K->nb[1], K->nb[2], K->nb[3], out); break;
+        case GGML_TYPE_Q5_1:   lp111_k8t<GGML_TYPE_Q5_1  ><<<cg, 256, 0, st>>>(src, K->ne[1], ntiles, nh, K->nb[1], K->nb[2], K->nb[3], out); break;
+        case GGML_TYPE_IQ4_NL: lp111_k8t<GGML_TYPE_IQ4_NL><<<cg, 256, 0, st>>>(src, K->ne[1], ntiles, nh, K->nb[1], K->nb[2], K->nb[3], out); break;
+        default: GGML_ABORT("lp111: K type %s", ggml_type_name(K->type));
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+static void lp111_v8t_launch(cudaStream_t st, const ggml_tensor * V, const int64_t ntiles, int * out) {
+    const int64_t nh = V->ne[2], ns = V->ne[3];
+    const int64_t nwork = ntiles*256;
+    const dim3 cg(unsigned((nwork + 255)/256 < 1024 ? (nwork + 255)/256 : 1024), unsigned(ns*nh));
+    const char * src = (const char *) V->data;
+    switch (V->type) {
+        case GGML_TYPE_Q8_0:   lp111_v8t<GGML_TYPE_Q8_0  ><<<cg, 256, 0, st>>>(src, V->ne[1], ntiles, nh, V->nb[1], V->nb[2], V->nb[3], out); break;
+        case GGML_TYPE_Q4_0:   lp111_v8t<GGML_TYPE_Q4_0  ><<<cg, 256, 0, st>>>(src, V->ne[1], ntiles, nh, V->nb[1], V->nb[2], V->nb[3], out); break;
+        case GGML_TYPE_Q4_1:   lp111_v8t<GGML_TYPE_Q4_1  ><<<cg, 256, 0, st>>>(src, V->ne[1], ntiles, nh, V->nb[1], V->nb[2], V->nb[3], out); break;
+        case GGML_TYPE_Q5_0:   lp111_v8t<GGML_TYPE_Q5_0  ><<<cg, 256, 0, st>>>(src, V->ne[1], ntiles, nh, V->nb[1], V->nb[2], V->nb[3], out); break;
+        case GGML_TYPE_Q5_1:   lp111_v8t<GGML_TYPE_Q5_1  ><<<cg, 256, 0, st>>>(src, V->ne[1], ntiles, nh, V->nb[1], V->nb[2], V->nb[3], out); break;
+        case GGML_TYPE_IQ4_NL: lp111_v8t<GGML_TYPE_IQ4_NL><<<cg, 256, 0, st>>>(src, V->ne[1], ntiles, nh, V->nb[1], V->nb[2], V->nb[3], out); break;
+        default: GGML_ABORT("lp111: V type %s", ggml_type_name(V->type));
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
@@ -2335,6 +2783,44 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             }
             return;
         }
+#if LP73_ON
+        if (lp111_prefill_eligible(dst, cc)) { // local patch 0111: low-bit K/V through the same pre-pass tiles
+            static thread_local unsigned logged111 = 0;
+            if (getenv("GGML_CUDA_LP0027_TRACE") && logged111++ < 4) {
+                GGML_LOG_WARN("LP0111_DP4A_PREFILL gpu=%d q=%lld kv=%lld group=%d K=%s V=%s\n", id, (long long) Q->ne[1],
+                    (long long) K->ne[1], ncols2, ggml_type_name(K->type), ggml_type_name(V->type));
+            }
+            const int64_t KV = V->ne[1], ntiles = (KV + 31)/32, nh = V->ne[2], ns = V->ne[3];
+            ggml_cuda_pool_alloc<int> v8t(ctx.pool(), size_t(ns*nh*ntiles*2304));
+            lp111_v8t_launch(ctx.stream(), V, ntiles, v8t.get());
+            ggml_tensor Vt = *V;
+            Vt.data  = v8t.get();
+            Vt.nb[2] = size_t(ntiles*2304)*sizeof(int);
+            Vt.nb[3] = size_t(nh*ntiles*2304)*sizeof(int);
+            const bool k_aff = lp111_aff(K->type);
+            const int64_t kti = k_aff ? 2560 : 2304, nhk = K->ne[2], nsk = K->ne[3];
+            ggml_cuda_pool_alloc<int> k8t(ctx.pool(), size_t(nsk*nhk*ntiles*kti));
+            lp111_k8t_launch(ctx.stream(), K, ntiles, k8t.get());
+            ggml_tensor Kt = *K;
+            Kt.data  = k8t.get();
+            Kt.nb[2] = size_t(ntiles*kti)*sizeof(int);
+            Kt.nb[3] = size_t(nhk*ntiles*kti)*sizeof(int);
+            ggml_tensor * const K_orig = dst->src[1];
+            ggml_tensor * const V_orig = dst->src[2];
+            dst->src[1] = &Kt;
+            dst->src[2] = &Vt;
+            if (k_aff) {
+                launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false,false,false,GGML_TYPE_Q4_1>,
+                    8,0,32,false,false,false,false,warp_size);
+            } else {
+                launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false>,
+                    8,0,32,false,false,false,false,warp_size);
+            }
+            dst->src[1] = K_orig;
+            dst->src[2] = V_orig;
+            return;
+        }
+#endif // LP73_ON
         // local patch 0031: DP4A Q.K for decode / MTP verify; V through the fused q8 loader, no F16 copies needed.
         static const bool on31=[] { const char *e=getenv("GGML_CUDA_LP0031"); return !(e && atoi(e)==0); }();
         static const long long min_kv31=[] { const char *e=getenv("GGML_CUDA_LP0031_MIN_KV"); return e ? atoll(e) : -1LL; }();
@@ -2355,6 +2841,10 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                 return;
             }
             launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,true,false>,8,0,32,false,false,false,false,warp_size);
+            return;
+        }
+        if (lp111_decode_eligible(dst, cc)) { // local patch 0111: low-bit K/V decode / verify on the same DP4A tiles
+            lp111_launch_decode_any(ctx, dst, ncols2, false);
             return;
         }
     }
@@ -2470,6 +2960,10 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (lp111_fold_shape(dst) && lp111_decode_eligible(dst, cc)) { // local patch 0111: low-bit GQA-6 decode (0067 fold)
+            lp111_launch_decode_any(ctx, dst, 8, true);
+            return;
+        }
         if (lp0024_eligible(dst, cc)) {
             // local patch 0067: long-context GQA-6 decode on the DP4A tile kernel (fold layout, 32 columns)
             static const bool on67 = [] { const char * e = getenv("GGML_CUDA_LP0067"); return !(e && atoi(e) == 0); }();

@@ -578,6 +578,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL: // local patch 0111 (lab DP4A routes on Pascal; F16 copy elsewhere)
         case GGML_TYPE_F8_E4M3:
             return true;
         default:
@@ -786,7 +787,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // local patch 0079: the lab tile / DP4A kernels read q8_0 directly and beat the vec kernel for 1- and
             // 2-token batches too (-17..-76% on the P5000); keep vec only where the tile path would need F16 copies.
             static const bool lp79 = [] { const char * e = getenv("GGML_CUDA_LP0079"); return !(e && atoi(e) == 0); }();
-            const bool lp79_tile = lp79 && ggml_cuda_fattn_tile_fused_q8(dst, ggml_cuda_info().devices[device].cc);
+            const bool lp79_tile = lp79 && (ggml_cuda_fattn_tile_fused_q8(dst, ggml_cuda_info().devices[device].cc) ||
+                lp111_decode_eligible(dst, ggml_cuda_info().devices[device].cc)); // local patch 0111
             if (Q->ne[1] <= 2 && !lp79_tile) {
                 return BEST_FATTN_KERNEL_VEC;
             }
@@ -817,8 +819,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
                 return e && atoi(e) != 0;
             }();
             const int cc = ggml_cuda_info().devices[device].cc;
-            const bool reads_quantized_cache = ggml_cuda_fattn_tile_fused_q8(dst, cc) ||
-                (reserve_native_prefill && lp27_prefill_eligible(dst, cc));
+            const bool reads_quantized_cache = ggml_cuda_fattn_tile_fused_q8(dst, cc) || lp111_decode_eligible(dst, cc) ||
+                (reserve_native_prefill && (lp27_prefill_eligible(dst, cc) || lp111_prefill_eligible(dst, cc))); // 0111
             need_f16_K = !reads_quantized_cache;
             need_f16_V = need_f16_K;
             break;

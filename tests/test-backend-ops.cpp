@@ -13305,6 +13305,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
     }
+    // local patch 0111: every low-bit K/V pair on the Pascal DP4A routes -- decode / verify / short tiles (GQA 8), GQA-6 fold
+    // (kv % 256 == 0), unaligned KV (ncols2 = 1 with bounds checks) and prefill (pre-pass tiles)
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL, }) {
+        for (ggml_type tv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL, }) {
+            if (tk == GGML_TYPE_Q8_0 && (tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_Q4_0)) {
+                continue;
+            }
+            for (int nr2 : { 6, 8, }) {
+                for (int nb : { 1, 2, 3, 5, 16, 128, }) {
+                    for (int kv : { 4096, 8192 + 77, 16384, }) {
+                        if (nb == 128 && kv == 16384) {
+                            continue;
+                        }
+                        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, nb, true, false, 0, 0,
+                                                                        GGML_PREC_F32, tk, tv));
+                    }
+                }
+            }
+        }
+    }
     // local patch 0067: Qwen3.8 shape -- head 256, GQA 6, q8_0 K/V, decode / MTP verify, long KV (DP4A fold route)
     for (int nb : { 1, 2, 3, }) {
         for (int kv : { 4096, 8192, 8192 + 77, }) {
