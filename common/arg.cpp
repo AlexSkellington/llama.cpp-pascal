@@ -2953,6 +2953,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(
+        { "-fitu", "--fit-util" }, "F",
+        "local patch 0112: with -c 0 and --fit on, size the context so this process uses at most F (0..1] of each GPU's total "
+        "memory (vLLM gpu_memory_utilization), measured on the devices after the model is loaded; also enables that measured "
+        "planning outside tensor split (default: 0 = free memory minus --fit-target only; tensor split always uses it)",
+        [](common_params & params, const std::string & value) {
+            params.fit_params_util = std::stof(value);
+            if (params.fit_params_util < 0.0f || params.fit_params_util > 1.0f) {
+                throw std::invalid_argument("--fit-util must be in [0, 1]");
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_UTIL"));
+    add_opt(common_arg(
         { "-fitc", "--fit-ctx" }, "N",
         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
         [](common_params & params, int value) {

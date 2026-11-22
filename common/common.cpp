@@ -1235,8 +1235,172 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+// local patch 0112: measured KV capacity planning (see apply0112.py). Returns true if it chose cparams.n_ctx.
+static bool common_kv_plan_active(const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams) {
+    return cparams.n_ctx == 0 && params.fit_params && (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR || params.fit_params_util > 0.0f);
+}
+
+static void common_kv_plan(common_params & params, llama_model * model, llama_context_params & cparams) {
+    constexpr int64_t MiB = 1024*1024;
+    // the GPUs that hold the model: --device if given, else every GPU
+    std::vector<ggml_backend_dev_t> devs;
+    std::vector<size_t>             dev_idx;   // index in the ggml device list (the --fit-target index)
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        bool use = params.devices.empty();
+        for (ggml_backend_dev_t pd : params.devices) {
+            use = use || pd == d;
+        }
+        if (use) {
+            devs.push_back(d);
+            dev_idx.push_back(i);
+        }
+    }
+    if (devs.empty()) {
+        LOG_WRN("kv-plan: no GPU devices, keeping the default context size%s", "\n");
+        return;
+    }
+    const size_t nd = devs.size();
+    const uint32_t n_streams = cparams.kv_unified ? 1 : std::max<uint32_t>(1, cparams.n_seq_max);
+    const uint32_t align     = 256 * n_streams;
+    const uint32_t n_train   = llama_model_n_ctx_train(model);
+    const uint64_t n_cap     = uint64_t(n_train) * n_streams;
+
+    // the MTP context follows the target context and runs on the same weights (common_fit_apply builds it the same way)
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    common_params        params_dft  = common_base_params_to_speculative(params);
+    llama_context_params cparams_dft = common_context_params_to_llama(params_dft);
+    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cparams_dft.n_rs_seq = 0;
+    if (params.speculative.has_dft()) {
+        LOG_WRN("kv-plan: a separate draft model is not part of the probes; keep its memory in --fit-target%s", "\n");
+    }
+
+    auto read_free = [&](std::vector<int64_t> & fr, std::vector<int64_t> * tot) {
+        fr.assign(nd, 0);
+        if (tot) {
+            tot->assign(nd, 0);
+        }
+        for (size_t j = 0; j < nd; ++j) {
+            size_t f = 0, t = 0;
+            ggml_backend_dev_memory(devs[j], &f, &t);
+            fr[j] = int64_t(f);
+            if (tot) {
+                (*tot)[j] = int64_t(t);
+            }
+        }
+    };
+    // create the contexts at n_ctx, read every GPU's free memory, free them; false if creation failed
+    auto probe = [&](uint32_t n_ctx, std::vector<int64_t> & fr) -> bool {
+        llama_context_params cp = cparams;
+        cp.n_ctx      = n_ctx;
+        cp.samplers   = nullptr;
+        cp.n_samplers = 0;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (ctx == nullptr) {
+            return false;
+        }
+        llama_context * ctx_dft = nullptr;
+        if (spec_mtp) {
+            llama_context_params cpd = cparams_dft;
+            cpd.n_ctx = n_ctx;
+            ctx_dft = llama_init_from_model(model, cpd);
+        }
+        read_free(fr, nullptr);
+        if (ctx_dft) {
+            llama_free(ctx_dft);
+        }
+        llama_free(ctx);
+        return !spec_mtp || ctx_dft != nullptr;
+    };
+
+    std::vector<int64_t> free0, total, freeA, freeB;
+    read_free(free0, &total);
+    const uint32_t nA = 4096 * n_streams, nB = 16384 * n_streams;
+    if (!probe(nA, freeA) || !probe(nB, freeB)) {
+        LOG_WRN("kv-plan: probe context creation failed, keeping the default context size%s", "\n");
+        return;
+    }
+    std::vector<int64_t> avail(nd), fixedA(nd);
+    std::vector<double>  slope(nd);
+    uint64_t n_best = UINT64_MAX;
+    size_t   j_lim  = 0;
+    for (size_t j = 0; j < nd; ++j) {
+        const int64_t margin = int64_t(params.fit_params_target[dev_idx[j]]);
+        avail[j] = free0[j] - margin;
+        if (params.fit_params_util > 0.0f) {
+            avail[j] = std::min<int64_t>(avail[j], int64_t(double(total[j])*params.fit_params_util) - (total[j] - free0[j]));
+        }
+        fixedA[j] = free0[j] - freeA[j];
+        slope[j]  = std::max(1.0, double(freeA[j] - freeB[j]) / double(nB - nA));
+        const double n_j = double(nA) + double(avail[j] - fixedA[j]) / slope[j];
+        const uint64_t n = n_j <= 0.0 ? 0 : uint64_t(n_j);
+        if (n < n_best) {
+            n_best = n;
+            j_lim  = j;
+        }
+    }
+    uint64_t n_ctx = std::min<uint64_t>(n_best, n_cap);
+    n_ctx -= n_ctx % align;
+    if (n_ctx < align) {
+        LOG_WRN("kv-plan: not even %u cells fit the budget, keeping the default context size%s", align, "\n");
+        return;
+    }
+    // verify on the devices and shrink until every GPU keeps its margin
+    std::vector<int64_t> freeV;
+    bool verified = false;
+    for (int it = 0; it < 4 && n_ctx >= align; ++it) {
+        if (!probe(uint32_t(n_ctx), freeV)) {
+            n_ctx = (n_ctx/2) - (n_ctx/2) % align;
+            continue;
+        }
+        int64_t deficit = 0;
+        for (size_t j = 0; j < nd; ++j) {
+            const int64_t left = freeV[j] - (free0[j] - avail[j]);   // free memory above the margin / util cap
+            if (left < 0) {
+                deficit = std::max<int64_t>(deficit, int64_t(double(-left) / slope[j]) + 1);
+            }
+        }
+        if (deficit == 0) {
+            verified = true;
+            break;
+        }
+        n_ctx = n_ctx > uint64_t(deficit) + align ? n_ctx - deficit - align : 0;
+        n_ctx -= n_ctx % align;
+    }
+    if (!verified) {
+        LOG_WRN("kv-plan: could not verify a context size, keeping the default context size%s", "\n");
+        return;
+    }
+    cparams.n_ctx = uint32_t(n_ctx);
+    params.n_ctx  = int32_t(n_ctx);
+
+    LOG_INF("kv-plan: context size from measured probe contexts (n_ctx %u and %u%s, K %s / V %s); projections, not live-workload measurements%s",
+        nA, nB, spec_mtp ? " + MTP context" : "", ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v), "\n");
+    for (size_t j = 0; j < nd; ++j) {
+        LOG_INF("kv-plan:   %-8s %s: total %6" PRId64 " MiB, free before context %6" PRId64 " MiB, budget %6" PRId64
+            " MiB (margin %" PRId64 " MiB%s), context %5" PRId64 " MiB @ %u + %.1f KiB/cell -> %" PRIu64 " cells, verified free %" PRId64 " MiB%s%s",
+            ggml_backend_dev_name(devs[j]), ggml_backend_dev_description(devs[j]), total[j]/MiB, free0[j]/MiB, avail[j]/MiB,
+            int64_t(params.fit_params_target[dev_idx[j]])/MiB, params.fit_params_util > 0.0f ? ", util cap" : "",
+            fixedA[j]/MiB, nA, slope[j]/1024.0,
+            uint64_t(std::max(0.0, double(nA) + double(avail[j] - fixedA[j]) / slope[j])), freeV[j]/MiB,
+            j == j_lim ? "  <- limits" : "", "\n");
+    }
+    LOG_INF("kv-plan: physical KV capacity %" PRIu64 " cells; model trained context %u x %u stream(s) = %" PRIu64 "; chosen n_ctx %" PRIu64
+        " -> %" PRIu64 " cells per sequence (%u stream(s))%s",
+        n_best, n_train, n_streams, n_cap, n_ctx, n_ctx / n_streams, n_streams, "\n");
+}
+
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (!params.fit_params) {
+        return;
+    }
+    if (common_kv_plan_active(params, mparams, cparams)) {
+        // local patch 0112: the context is sized on the real devices after the model is loaded (common_kv_plan)
         return;
     }
 
@@ -1381,6 +1545,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    if (common_kv_plan_active(params, mparams, cparams)) {
+        common_kv_plan(params, model, cparams); // local patch 0112
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
