@@ -675,13 +675,53 @@ static __device__ __forceinline__ float lp111_elem(const char * blk, const int e
 
 // any supported type -> the FP32 tile layout of flash_attn_tile_load_tile_q8 (same work split: a quarter block = 8
 // elements = words 2q, 2q+1 per item); stride_KV is in blocks
-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, int vt>
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, int vt, bool pair_ok = false>
 static __device__ __forceinline__ void flash_attn_tile_load_tile_lp111(
         const char * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
     static_assert(J % 32 == 0, "bad J for a 32-element block type");
     constexpr int row_bytes = (J + J_padding)*int(sizeof(float));
     constexpr int st_nb = row_bytes % 16 == 0 ? 16 : (row_bytes % 8 == 0 ? 8 : 4);
     constexpr int nblk     = J/32;
+    if constexpr (vt != GGML_TYPE_Q8_0) { // local patch 0111d: item = 4 bytes of one block loaded once -> both nibble halves
+        constexpr int items4 = I*nblk*4;
+        constexpr int nthr4  = nwarps*warp_size;
+        const int tid4 = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+        for (int it0 = 0; it0 < items4; it0 += nthr4) {
+            const int it = it0 + tid4;
+            if (it0 + nthr4 > items4 && it >= items4) {
+                break;
+            }
+            const int j = it % 4;                            // bytes 4j..4j+3 = words j (elements 4j..) and j+4 (16+4j..)
+            const int b = (it / 4) % nblk;
+            const int i = it / (4*nblk);
+            __align__(16) float lo[4], hi[4];
+            if (!oob_check || i < i_sup) {
+                const char * blk = KV + (int64_t(i)*stride_KV + b)*lp111_bsz(vt);
+                const float2 dm = lp111_dm<vt>(blk);
+                const int2 w = lp111_word_pair<vt>(blk, j);
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    lo[l] = dm.x*float(int8_t(w.x >> (8*l))) + dm.y;
+                    hi[l] = dm.x*float(int8_t(w.y >> (8*l))) + dm.y;
+                }
+            } else {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    lo[l] = 0.0f;
+                    hi[l] = 0.0f;
+                }
+            }
+            float * dst = tile_KV + i*(J + J_padding) + b*32 + 4*j;
+            constexpr int st4 = st_nb < 16 ? st_nb : 16;
+#pragma unroll
+            for (int l = 0; l < 4; l += st4/int(sizeof(float))) {
+                ggml_cuda_memcpy_1<st4>(dst + l, lo + l);
+                ggml_cuda_memcpy_1<st4>(dst + 16 + l, hi + l);
+            }
+        }
+        return;
+    }
     constexpr int items    = I*nblk*4;
     constexpr int nthreads = nwarps*warp_size;
     const int tid = threadIdx.y*warp_size + threadIdx.x;
