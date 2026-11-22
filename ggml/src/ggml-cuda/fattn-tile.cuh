@@ -634,6 +634,27 @@ static __device__ __forceinline__ int lp111_word(const char * blk, const int w) 
     }
 }
 
+// local patch 0111b: words j and j+4 (j = 0..3) of one nibble block from a single 32-bit load of qs[4j..4j+3]
+template <int kt>
+static __device__ __forceinline__ int2 lp111_word_pair(const char * blk, const int j) {
+    static_assert(kt != GGML_TYPE_Q8_0, "nibble types only");
+    const uint32_t x = lp111_ld32(blk + lp111_qs_off(kt) + 4*j);
+    if constexpr (kt == GGML_TYPE_IQ4_NL) {
+        return get_int_from_table_16(int(x), kvalues_iq4nl);
+    } else {
+        uint32_t lo = x & 0x0F0F0F0Fu;
+        uint32_t hi = (x >> 4) & 0x0F0F0F0Fu;
+        if constexpr (kt == GGML_TYPE_Q5_0 || kt == GGML_TYPE_Q5_1) {
+            const uint32_t qh = lp111_ld32(blk + lp111_qh_off(kt));
+            const uint32_t hl = (qh >> (4*j)) & 0xFu, hh = (qh >> (4*j + 16)) & 0xFu;
+            lo |= ((hl & 1u) << 4) | ((hl & 2u) << 11) | ((hl & 4u) << 18) | ((hl & 8u) << 25);
+            hi |= ((hh & 1u) << 4) | ((hh & 2u) << 11) | ((hh & 4u) << 18) | ((hh & 8u) << 25);
+        }
+        const uint32_t c = uint32_t(lp111_center(kt))*0x01010101u;
+        return make_int2(int(((lo | 0x80808080u) - c) ^ 0x80808080u), int(((hi | 0x80808080u) - c) ^ 0x80808080u));
+    }
+}
+
 // (d, m') of one block: value = d*int8 + m'; m' = 0 for the symmetric types
 template <int kt>
 static __device__ __forceinline__ float2 lp111_dm(const char * blk) {
@@ -1495,17 +1516,20 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         if (word%8 == 0) KV_tmp[(words+block)*pitch+row]=d;
     }
     } else {
-        // local patch 0111: low-bit K decoded to the same int8 words + scales (+ m' rows for q4_1 / q5_1)
-        for (int t = threadIdx.y*warp_size+threadIdx.x; t < nbatch_fa*words; t += nwarps*warp_size) {
-            const int row=t/words, word=t%words, block=word/8;
-            int packed=0; float2 dm=make_float2(0.0f, 0.0f);
+        // local patch 0111 / 0111b: low-bit K decoded to the same int8 words + scales (+ m' rows for q4_1 / q5_1);
+        // one work item = words j and j+4 of a block (one 32-bit load of the nibbles)
+        constexpr int halfw = words/2;
+        for (int t = threadIdx.y*warp_size+threadIdx.x; t < nbatch_fa*halfw; t += nwarps*warp_size) {
+            const int row=t/halfw, hw=t%halfw, block=hw/4, j=hw%4, word=block*8+j;
+            int2 packed=make_int2(0, 0); float2 dm=make_float2(0.0f, 0.0f);
             if (!oob_check || row < k_VKQ_sup) {
                 const char * key=(const char *) K_h2 + (int64_t(k_VKQ_0+row)*stride_K2+block)*lp111_bsz(kt);
-                packed=lp111_word<kt>(key, word%8);
-                if (word%8 == 0) dm=lp111_dm<kt>(key);
+                packed=lp111_word_pair<kt>(key, j);
+                if (j == 0) dm=lp111_dm<kt>(key);
             }
-            packed_K[word*pitch+row]=packed;
-            if (word%8 == 0) {
+            packed_K[word*pitch+row]=packed.x;
+            packed_K[(word+4)*pitch+row]=packed.y;
+            if (j == 0) {
                 KV_tmp[(words+block)*pitch+row]=dm.x;
                 if constexpr (k_aff) {
                     KV_tmp[(words+DKQ/32+block)*pitch+row]=dm.y;
