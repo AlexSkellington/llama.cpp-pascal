@@ -1769,8 +1769,9 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
         constexpr int nkg = nbatch_fa/4;                      // 8 groups of 4 keys
         constexpr int nvb = DV/32;                            // 8 V blocks per row
         int   * const V8T = (int *) KV_tmp;                    // [nkg][DV]: int8 of keys 4kg..4kg+3 for one dim
-        float * const Vd  = (float *) KV_tmp + nkg*DV;         // [key][block] V scales
+        float * const Vd  = (float *) KV_tmp + nkg*DV;         // [block][key] V scales (0114b: conflict-free for lane = key)
         __shared__ int P8s[ncols*nvb*nkg];                     // [column][block][key group]: int8 of 4 keys
+        __shared__ float Pss[ncols*nvb];                       // [column][block] P scales (0114b)
         const int tid = threadIdx.y*warp_size + threadIdx.x;
         for (int it = tid; it < nkg*(DV/4); it += nwarps*warp_size) {
             const int kg = it / (DV/4), w = it % (DV/4), blk = w/8, wb = w%8;
@@ -1783,10 +1784,10 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
                     const char * vb = (const char *) V_h2 + (int64_t(k_VKQ_0 + k)*stride_V2 + blk)*lp111_bsz(vt_eff);
                     x[r] = lp111_word<vt_eff>(vb, wb);
                     if (wb == 0) {
-                        Vd[k*nvb + blk] = lp111_dm<vt_eff>(vb).x;
+                        Vd[blk*nbatch_fa + k] = lp111_dm<vt_eff>(vb).x;
                     }
                 } else if (wb == 0) {
-                    Vd[k*nvb + blk] = 0.0f;
+                    Vd[blk*nbatch_fa + k] = 0.0f;
                 }
             }
             // 4x4 byte transpose: out_i = byte i of x[0..3] (one dim, four keys)
@@ -1796,58 +1797,71 @@ static __device__ __forceinline__ void lpdp4a_tile_iter(
                                                       __byte_perm(t2, t3, 0x5410), __byte_perm(t2, t3, 0x7632));
         }
         __syncthreads();
-        // per-tile bound of |d_v| per block (each warp computes it, lane = key)
-        float vdm[nvb];
-#pragma unroll
-        for (int b = 0; b < nvb; ++b) {
-            vdm[b] = warp_reduce_max<warp_size>(fabsf(Vd[threadIdx.x*nvb + b]));
-        }
-        // P (lane = key) -> int8 per (column, block) with the V scale folded in; scale = max P * vdm[b] / 127
-        float pm[cpw];
+        // 0114c: P (lane = key) -> int8 per (column, block), V scale folded in, exact scale per (column, block) from a
+        // transposed 8-way max-reduction (9 shuffles); then DP4A over 4-key groups, one dim group at a time (8 live ints)
+        const int lane = threadIdx.x;
+        const bool h4 = lane & 16, h3 = lane & 8, h2 = lane & 4;
+        const int my_blk = (h4 ? 4 : 0) + (h3 ? 2 : 0) + (h2 ? 1 : 0);
 #pragma unroll
         for (int jc = 0; jc < cpw; ++jc) {
             const int jcb = jc + threadIdx.y*cpw;
-            pm[jc] = warp_reduce_max<warp_size>(P50[jc]);
+            float pv[nvb];
+#pragma unroll
+            for (int bb = 0; bb < nvb; ++bb) {
+                pv[bb] = P50[jc]*Vd[bb*nbatch_fa + lane];
+            }
+            float r4[4], r2[2];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float keep = fabsf(h4 ? pv[j + 4] : pv[j]);
+                const float send = fabsf(h4 ? pv[j] : pv[j + 4]);
+                r4[j] = fmaxf(keep, __shfl_xor_sync(0xffffffff, send, 16));
+            }
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const float keep = h3 ? r4[j + 2] : r4[j];
+                const float send = h3 ? r4[j] : r4[j + 2];
+                r2[j] = fmaxf(keep, __shfl_xor_sync(0xffffffff, send, 8));
+            }
+            float r1 = fmaxf(h2 ? r2[1] : r2[0], __shfl_xor_sync(0xffffffff, h2 ? r2[0] : r2[1], 4));
+            r1 = fmaxf(r1, __shfl_xor_sync(0xffffffff, r1, 2));
+            r1 = fmaxf(r1, __shfl_xor_sync(0xffffffff, r1, 1));
+            if ((lane & 3) == 0) {
+                Pss[jcb*nvb + my_blk] = r1;                   // block max of |P * d_v|
+            }
+            __syncwarp();
             int8_t * const P8b = (int8_t *) (P8s + jcb*nvb*nkg);
 #pragma unroll
-            for (int b = 0; b < nvb; ++b) {
-                const float den = pm[jc]*vdm[b];
-                const int q = den > 0.0f ? __float2int_rn(P50[jc]*Vd[threadIdx.x*nvb + b]*(127.0f/den)) : 0;
-                P8b[b*nbatch_fa + threadIdx.x] = int8_t(max(-127, min(127, q)));
+            for (int bb = 0; bb < nvb; ++bb) {
+                const float mx = Pss[jcb*nvb + bb];
+                P8b[bb*nbatch_fa + lane] = int8_t(mx > 0.0f ? __float2int_rn(pv[bb]*(127.0f/mx)) : 0);
             }
         }
         __syncwarp();
-        int acc[DV/64][cpw][2];
+        const int bhalf = lane >> 4;                          // dims 64i+2lane, +1 lie in block 2i + (lane >= 16)
 #pragma unroll
         for (int i = 0; i < DV/64; ++i) {
+            int acc[cpw][2];
 #pragma unroll
             for (int jc = 0; jc < cpw; ++jc) {
-                acc[i][jc][0] = 0;
-                acc[i][jc][1] = 0;
+                acc[jc][0] = 0;
+                acc[jc][1] = 0;
             }
-        }
-        const int bhalf = threadIdx.x >> 4;                   // dims 64i+2lane, +1 lie in block 2i + (lane >= 16)
 #pragma unroll
-        for (int kg = 0; kg < nkg; ++kg) {
-#pragma unroll
-            for (int i = 0; i < DV/64; ++i) {
-                const int2 v = *(const int2 *) (V8T + kg*DV + 64*i + 2*threadIdx.x);
+            for (int kg = 0; kg < nkg; ++kg) {
+                const int2 v = *(const int2 *) (V8T + kg*DV + 64*i + 2*lane);
 #pragma unroll
                 for (int jc = 0; jc < cpw; ++jc) {
                     const int pk = P8s[((jc + threadIdx.y*cpw)*nvb + 2*i + bhalf)*nkg + kg];
-                    acc[i][jc][0] = ggml_cuda_dp4a(pk, v.x, acc[i][jc][0]);
-                    acc[i][jc][1] = ggml_cuda_dp4a(pk, v.y, acc[i][jc][1]);
+                    acc[jc][0] = ggml_cuda_dp4a(pk, v.x, acc[jc][0]);
+                    acc[jc][1] = ggml_cuda_dp4a(pk, v.y, acc[jc][1]);
                 }
             }
-        }
-#pragma unroll
-        for (int i = 0; i < DV/64; ++i) {
-            const float vb = bhalf ? vdm[2*i + 1] : vdm[2*i];
 #pragma unroll
             for (int jc = 0; jc < cpw; ++jc) {
-                const float sc = pm[jc]*vb*(1.0f/127.0f);
-                VKQ[jc*((DVp/2)/warp_size) + i].x += sc*float(acc[i][jc][0]);
-                VKQ[jc*((DVp/2)/warp_size) + i].y += sc*float(acc[i][jc][1]);
+                const float sc = Pss[(jc + threadIdx.y*cpw)*nvb + 2*i + bhalf]*(1.0f/127.0f);
+                VKQ[jc*((DVp/2)/warp_size) + i].x += sc*float(acc[jc][0]);
+                VKQ[jc*((DVp/2)/warp_size) + i].y += sc*float(acc[jc][1]);
             }
         }
         __syncthreads();
