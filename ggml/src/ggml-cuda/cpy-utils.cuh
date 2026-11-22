@@ -153,10 +153,24 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+#ifndef LP115_WEIGHTED
+#define LP115_WEIGHTED 1
+#endif
+// local patch 0115: scale search like the CPU quantizer (see apply0115.py)
+static __device__ void lp115_iq4_nl_fit(const float * __restrict__ x, const float id, float & sumqx, float & sumq2) {
+    sumqx = 0.0f; sumq2 = 0.0f;
+#pragma unroll 8
+    for (int j = 0; j < QK4_NL; ++j) {
+        const float v = kvalues_iq4nl[best_index_int8(16, kvalues_iq4nl, x[j]*id)];
+        const float w = LP115_WEIGHTED ? x[j]*x[j] : 1.0f;
+        sumqx += w*v*x[j];
+        sumq2 += w*v*v;
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
-
     for (int j = 0; j < QK4_NL; ++j) {
         const float v = x[j];
         if (amax < fabsf(v)) {
@@ -164,26 +178,43 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
             vmax = v;
         }
     }
-
-    float d = vmax / kvalues_iq4nl[0];
-    const float id = d ? 1.0f/d : 0.0f;
-
-    float sumqx = 0, sumq2 = 0;
+    if (amax == 0.0f) {
+        y->d = 0.0f;
+        for (int j = 0; j < QK4_NL/2; ++j) {
+            y->qs[j] = 0x88; // index 8 = value 1, times d = 0
+        }
+        return;
+    }
+    // plain guess first (the old behaviour), then the CPU's candidate range
+    float best_id = kvalues_iq4nl[0]/vmax;
+    float sumqx, sumq2;
+    lp115_iq4_nl_fit(x, best_id, sumqx, sumq2);
+    float best = sumq2 > 0.0f ? sumqx*sumqx/sumq2 : 0.0f;
+    for (int t = -7; t <= 7; ++t) {
+        const float id = (float(t) + float(kvalues_iq4nl[0]))/vmax;
+        lp115_iq4_nl_fit(x, id, sumqx, sumq2);
+        if (sumq2 > 0.0f && sumqx*sumqx > best*sumq2) {
+            best    = sumqx*sumqx/sumq2;
+            best_id = id;
+        }
+    }
+    lp115_iq4_nl_fit(x, best_id, sumqx, sumq2);
+    float d = sumq2 > 0.0f ? sumqx/sumq2 : 1.0f/best_id;
+    // reassign with the fitted scale and refit once
+    const float id = d != 0.0f ? 1.0f/d : 0.0f;
+    float sqx = 0.0f, sq2 = 0.0f;
     for (int j = 0; j < QK4_NL/2; ++j) {
-        const float x0 = x[0        + j]*id;
-        const float x1 = x[QK4_NL/2 + j]*id;
-        const uint8_t xi0 = best_index_int8(16, kvalues_iq4nl, x0);
-        const uint8_t xi1 = best_index_int8(16, kvalues_iq4nl, x1);
+        const uint8_t xi0 = best_index_int8(16, kvalues_iq4nl, x[0        + j]*id);
+        const uint8_t xi1 = best_index_int8(16, kvalues_iq4nl, x[QK4_NL/2 + j]*id);
         y->qs[j] = xi0 | (xi1 << 4);
         const float v0 = kvalues_iq4nl[xi0];
         const float v1 = kvalues_iq4nl[xi1];
-        const float w0 = x[0        + j]*x[0        + j];
-        const float w1 = x[QK4_NL/2 + j]*x[QK4_NL/2 + j];
-        sumqx += w0*v0*x[j] + w1*v1*x[QK4_NL/2 + j];
-        sumq2 += w0*v0*v0 + w1*v1*v1;
+        const float w0 = LP115_WEIGHTED ? x[0        + j]*x[0        + j] : 1.0f;
+        const float w1 = LP115_WEIGHTED ? x[QK4_NL/2 + j]*x[QK4_NL/2 + j] : 1.0f;
+        sqx += w0*v0*x[0 + j] + w1*v1*x[QK4_NL/2 + j];
+        sq2 += w0*v0*v0 + w1*v1*v1;
     }
-
-    y->d = sumq2 > 0 ? sumqx/sumq2 : d;
+    y->d = sq2 > 0.0f ? sqx/sq2 : d;
 }
 
 // Wrapper functions for cpy.cu compatibility

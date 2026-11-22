@@ -347,6 +347,21 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // local patch 0116: rotation size overrides for KV-quantization studies (power of two >= 64 dividing the head)
+    {
+        auto lp116 = [](const char * name, uint32_t & n_rot, int64_t head) {
+            const char * e = getenv(name);
+            if (e == nullptr || n_rot == 0) {
+                return;
+            }
+            const uint32_t v = (uint32_t) atoi(e);
+            if (v >= 64 && (v & (v - 1)) == 0 && head % v == 0) {
+                n_rot = v;
+            }
+        };
+        lp116("LLAMA_ATTN_ROT_K_N", n_rot_k, n_embd_head_k_all);
+        lp116("LLAMA_ATTN_ROT_V_N", n_rot_v, n_embd_head_v_all);
+    }
     LLAMA_LOG_INFO("%s: n_rot_k = %u, n_embd_head_k_all = %d\n", __func__, n_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: n_rot_v = %u, n_embd_head_k_all = %d\n", __func__, n_rot_v, n_embd_head_v_all);
 
