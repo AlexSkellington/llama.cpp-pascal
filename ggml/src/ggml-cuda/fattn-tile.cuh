@@ -1132,7 +1132,7 @@ static __global__ void flash_attn_tile(
 #ifdef FAST_FP16_AVAILABLE
     constexpr bool kv_q8_unsupported = kv_q8; // fused q8_0 only exists for the FP32 tile layout
 #else
-    constexpr bool kv_q8_unsupported = kv_q8 && !((DKQ == 128 || DKQ == 256) && DKQ == DV);
+    constexpr bool kv_q8_unsupported = kv_q8 && !((DKQ == 128 || DKQ == 256 || DKQ == 512) && DKQ == DV); // LP0051: + 512
 #endif // FAST_FP16_AVAILABLE
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512)) || kv_q8_unsupported) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
@@ -1926,7 +1926,7 @@ static __global__ void lpdp4a_tile(
 #ifdef FAST_FP16_AVAILABLE
     constexpr bool kv_q8_unsupported = kv_q8; // fused q8_0 only exists for the FP32 tile layout
 #else
-    constexpr bool kv_q8_unsupported = kv_q8 && !((DKQ == 128 || DKQ == 256) && DKQ == DV);
+    constexpr bool kv_q8_unsupported = kv_q8 && !((DKQ == 128 || DKQ == 256 || DKQ == 512) && DKQ == DV); // LP0051: + 512
 #endif // FAST_FP16_AVAILABLE
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512)) || kv_q8_unsupported) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
@@ -2293,12 +2293,17 @@ static bool ggml_cuda_fattn_tile_fused_q8(const ggml_tensor * dst, const int cc)
         const char * e = getenv("GGML_CUDA_TILE_FUSED_Q8_MAX_TOKENS");
         return e ? atoi(e) : 16;
     }();
+    // LP0051: GGML_CUDA_TILE_FUSED_Q8_D512=0 keeps head 512 on the stock F16-conversion path.
+    static const bool d512 = [] {
+        const char * e = getenv("GGML_CUDA_TILE_FUSED_Q8_D512");
+        return e == nullptr || atoi(e) != 0;
+    }();
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     return enabled && Q->ne[1] <= max_tokens && GGML_CUDA_CC_IS_NVIDIA(cc) && !fast_fp16_available(cc) &&
         K->type == GGML_TYPE_Q8_0 && lp71_v_ok(V) &&
-        K->ne[0] == V->ne[0] && (K->ne[0] == 128 || K->ne[0] == 256) &&
+        K->ne[0] == V->ne[0] && (K->ne[0] == 128 || K->ne[0] == 256 || (K->ne[0] == 512 && d512)) && // LP0051: + 512
         K->nb[1] % sizeof(block_q8_0) == 0 && lp71_v_aligned(V);
 }
 
@@ -2782,7 +2787,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
-    constexpr bool q8_capable = (DKQ == 128 || DKQ == 256) && DKQ == DV;
+    constexpr bool q8_capable = (DKQ == 128 || DKQ == 256 || DKQ == 512) && DKQ == DV; // LP0051: + 512
     const bool fused_q8 = q8_capable && ggml_cuda_fattn_tile_fused_q8(dst, cc);
     const bool need_f16 = !fused_q8;
     const bool fused_v4 = fused_q8 && dst->src[2]->type == GGML_TYPE_Q4_0; // local patch 0071

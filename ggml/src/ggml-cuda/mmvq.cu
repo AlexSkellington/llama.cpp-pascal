@@ -1,4 +1,7 @@
 #include "mmvq.cuh"
+#if __has_include("mmvq-q40-tune.h")
+#include "mmvq-q40-tune.h"
+#endif
 #if __has_include("lp83-knobs.h")
 #include "lp83-knobs.h"
 #endif
@@ -503,6 +506,14 @@ static constexpr __host__ __device__ bool lp72_has(ggml_type type) {
 }
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+#ifdef MMVQ_Q40_TUNE
+        if (type == GGML_TYPE_Q4_0 && ncols_dst >= 1 && ncols_dst <= 4) {
+            if (ncols_dst == 1 && small_k) {
+                return halve_iters ? MMVQ_Q40_TINY_NW : MMVQ_Q40_SK_NW;
+            }
+            return ncols_dst == 1 ? MMVQ_Q40_NW1 : MMVQ_Q40_NW24;
+        }
+#endif
         if (small_k && ncols_dst >= 4 && lp72_has(type)) {
             return LP72_NW; // local patch 0072
         }
@@ -661,6 +672,14 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+#ifdef MMVQ_Q40_TUNE
+    if (table_id == MMVQ_PARAMETERS_GENERIC && type == GGML_TYPE_Q4_0 && ncols_dst >= 1 && ncols_dst <= 4) {
+        if (ncols_dst == 1 && small_k) {
+            return nwarps == MMVQ_Q40_TINY_NW ? MMVQ_Q40_TINY_RPB : MMVQ_Q40_SK_RPB;
+        }
+        return ncols_dst == 1 ? MMVQ_Q40_RPB1 : MMVQ_Q40_RPB24;
+    }
+#endif
     if (table_id == MMVQ_PARAMETERS_GENERIC && small_k && ncols_dst >= 4 && lp72_has(type)) {
         return LP72_RPB; // local patch 0072
     }
@@ -1407,6 +1426,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if (should_use_small_k(c_ncols_dst)) {
+#ifdef MMVQ_Q40_TUNE
+                if constexpr (type == GGML_TYPE_Q4_0) {
+                    static_assert(MMVQ_Q40_NW1 == 4 && MMVQ_Q40_TINY_NW == 1 && MMVQ_Q40_SK_NW == 3, "tiers assume 1/3/4 warps");
+                    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+                        if (blocks_per_row_x <= blocks_per_iter_1warp) {          // one warp holds every K block
+                            launch(std::true_type{}, std::true_type{});
+                            break;
+                        }
+                        if (blocks_per_row_x > 3*blocks_per_iter_1warp) {        // 49..63 blocks: keep 4 warps
+                            launch(std::false_type{}, std::false_type{});
+                            break;
+                        }
+                    }
+                }
+#endif
 #ifdef MMVQ_AUTOTUNE
                 if constexpr (mmvq_at_tiny(type)) {
                     if (table_id == MMVQ_PARAMETERS_GENERIC && blocks_per_row_x <= blocks_per_iter_1warp) {
