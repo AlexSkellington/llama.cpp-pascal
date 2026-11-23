@@ -452,13 +452,13 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 // contiguous v/x values
 // local patch 0117 (port of ikawrakow/ik_llama.cpp#2876): on sm_61 a 32-bit integer multiply is 3 XMADs; the K-quant
 // scale * dot products are exact in fp32 (|values| <= 2^24), so multiply in fp32 there. MMQ path always on sm_61;
-// mat-vec (vmmq) path behind GGML_CUDA_KSCALE_FP32_VMMQ (A/B).
+// mat-vec (vmmq) path too (0117b, measured 2026-11-23); GGML_CUDA_KSCALE_INT_VMMQ turns it off.
 #if __CUDA_ARCH__ == 610
 typedef float mmq_kscale_t;
 #else
 typedef int   mmq_kscale_t;
 #endif
-#if __CUDA_ARCH__ == 610 && defined(GGML_CUDA_KSCALE_FP32_VMMQ)
+#if __CUDA_ARCH__ == 610 && !defined(GGML_CUDA_KSCALE_INT_VMMQ)  // 0117b: on by default (q3_K/q6_K mat-vec -4..9 %, others flat)
 typedef float vmmq_kscale_t;
 #else
 typedef int   vmmq_kscale_t;
