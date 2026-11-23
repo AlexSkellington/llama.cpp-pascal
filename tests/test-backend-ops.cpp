@@ -10843,8 +10843,47 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+
+// GGML_OP_ROPE_APPLY (leejet/ggml, used by stable-diffusion.cpp FLUX/Qwen-Image rope; 2026-11-22)
+struct test_rope_apply : public test_case {
+    const std::array<int64_t, 4> ne_a; // [head_dim, heads, tokens, batch]
+    const bool interleaved;
+    const bool permuted;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne_a, interleaved, permuted);
+    }
+
+    test_rope_apply(std::array<int64_t, 4> ne_a = {128, 8, 256, 1}, bool interleaved = false, bool permuted = false)
+        : ne_a(ne_a), interleaved(interleaved), permuted(permuted) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (permuted) {
+            a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[2], ne_a[1], ne_a[3]);
+            a = ggml_permute(ctx, a, 0, 2, 1, 3);
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        }
+        ggml_set_name(a, "a");
+        ggml_tensor * pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, ne_a[0]/2, ne_a[2]);
+        ggml_set_name(pe, "pe");
+        ggml_tensor * out = ggml_rope_apply(ctx, a, pe, interleaved);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (bool interleaved : {false, true}) {
+        for (bool permuted : {false, true}) {
+            test_cases.emplace_back(new test_rope_apply({128, 24, 1536, 1}, interleaved, permuted)); // FLUX.2 klein-like
+            test_cases.emplace_back(new test_rope_apply({128,  3,   77, 2}, interleaved, permuted));
+            test_cases.emplace_back(new test_rope_apply({ 64,  4,   33, 1}, interleaved, permuted));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
