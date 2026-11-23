@@ -3555,7 +3555,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q_few(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    // 0118: MMQ uses 32-bit dst offsets (int64 costs Pascal 8-10 %); a >2^31-element dst (all-logits output head
+    // at a huge ubatch) takes the cuBLAS path instead
+    if (ggml_nelements(dst) <= INT32_MAX && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }

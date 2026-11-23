@@ -452,6 +452,7 @@ static bool lab_mmq_mul_mat_q(
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const bool fuse_glu) {
+    GGML_ASSERT(ggml_nelements(dst) <= INT32_MAX && "MMQ dst offsets are 32-bit (local patch 0118)");
     lab_mmq_mul_mat_q(ctx, src0, src1, ids, dst, fusion, fuse_glu, nullptr);
 }
 
