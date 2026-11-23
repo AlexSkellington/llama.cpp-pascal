@@ -27,6 +27,17 @@
 
 // index of the nearest kvalues_iq4nl value, with mid[k] = (values[k] + values[k+1])/2
 // for this table it matches a binary search with the tie rule x - values[k] < values[k+1] - x for every float x
+float ggml_fp8_e5m2_to_fp32(uint8_t x) {
+    const ggml_fp16_t value = (ggml_fp16_t) x << 8;
+    return GGML_FP16_TO_FP32(value);
+}
+
+void dequantize_row_f8_e5m2(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_fp8_e5m2_to_fp32(x[i]);
+    }
+}
+
 static inline int best_index_iq4nl(const float * GGML_RESTRICT mid, float x) {
     int l = 15;
     for (int k = 0; k < 15; ++k) l -= x < mid[k];
