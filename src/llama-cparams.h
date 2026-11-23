@@ -40,8 +40,6 @@ struct llama_cparams {
     bool flash_attn;
     bool split_overlap;   // local patch 0090, see llama_context_params::split_overlap
     bool auto_fa;
-    bool fused_lid;          // use fused lightning indexer
-    bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
@@ -55,6 +53,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;

@@ -40,8 +40,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Match the upstream UI release used by the Pascal build.
-  HF_UI_VERSION: ${{ vars.LLAMA_CI_UI_VERSION || 'b12463' }}
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
   GGML_SCHED_DEBUG_REALLOC: 1
@@ -142,8 +140,10 @@ jobs:
           source .venv/Scripts/activate
           pip install -r requirements/requirements-convert_hf_to_gguf.txt
 
-      - name: Install LLVM 22
-        uses: ./.github/actions/pascal-windows-llvm
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Build
         id: cmake_build
