@@ -450,6 +450,20 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 #define VDR_Q3_K_Q8_1_MMQ  2
 
 // contiguous v/x values
+// local patch 0117 (port of ikawrakow/ik_llama.cpp#2876): on sm_61 a 32-bit integer multiply is 3 XMADs; the K-quant
+// scale * dot products are exact in fp32 (|values| <= 2^24), so multiply in fp32 there. MMQ path always on sm_61;
+// mat-vec (vmmq) path behind GGML_CUDA_KSCALE_FP32_VMMQ (A/B).
+#if __CUDA_ARCH__ == 610
+typedef float mmq_kscale_t;
+#else
+typedef int   mmq_kscale_t;
+#endif
+#if __CUDA_ARCH__ == 610 && defined(GGML_CUDA_KSCALE_FP32_VMMQ)
+typedef float vmmq_kscale_t;
+#else
+typedef int   vmmq_kscale_t;
+#endif
+
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
     const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const int * __restrict__ scales,
     const float & d3, const float * __restrict__ d8) {
@@ -474,7 +488,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
             sumi = ggml_cuda_dp4a(0xFCFCFCFC, u[VDR_Q3_K_Q8_1_MMVQ*i + j], sumi);
         }
 
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * (sumi * (vmmq_kscale_t)sc);
     }
 
     return d3 * sumf;
@@ -521,8 +535,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += d8[i] * (dot1 * (vmmq_kscale_t)sc[i]);
+        sumf_m += d8[i] * (dot2 * (vmmq_kscale_t)m[i]);  // multiply constant part of q4_K with sum of q8_1 values
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -549,7 +563,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 
         const float2 ds8f = __half22float2(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * sumi_d);
+        sumf_d += ds8f.x * ((mmq_kscale_t)sc[i] * sumi_d);
         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
@@ -583,8 +597,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * (dot1 * (vmmq_kscale_t)sc[i]);
+        sumf_m += d8[i] * (dot2 * (vmmq_kscale_t)m[i]);
 
     }
 
@@ -612,7 +626,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 
         const float2 ds8f = __half22float2(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * sumi_d);
+        sumf_d += ds8f.x * ((mmq_kscale_t)sc[i] * sumi_d);
         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
@@ -646,7 +660,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
             sumi = ggml_cuda_dp4a(0xE0E0E0E0, u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi);
         }
 
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * (sumi * (vmmq_kscale_t)sc);
     }
 
     return d*sumf;
@@ -675,7 +689,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
             sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
         }
 
-        sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
+        sumf_d += d8[i0/4] * ((mmq_kscale_t)sc_reg[i0/2+0]*sumi_d.x + (mmq_kscale_t)sc_reg[i0/2+1]*sumi_d.y);
     }
 
     return d6 * sumf_d;
