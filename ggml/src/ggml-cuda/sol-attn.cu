@@ -106,6 +106,7 @@ static __global__ void sol_thresholds(const float* qm, const float* stats, float
     }
 }
 
+#ifdef AMPERE_MMA_AVAILABLE
 using SolQTile = ggml_cuda_mma::tile<16, 8, nv_bfloat162>;
 using SolKTile = ggml_cuda_mma::tile<8, 8, nv_bfloat162>;
 using SolTile  = ggml_cuda_mma::tile<16, 8, float>;
@@ -185,6 +186,8 @@ static __device__ __forceinline__ void sol_update(SolTile (&scores)[8], SolTile 
     }
     __syncwarp();
 }
+
+#endif
 
 static __global__ __launch_bounds__(128) void sol_forward(
     const nv_bfloat16* q,

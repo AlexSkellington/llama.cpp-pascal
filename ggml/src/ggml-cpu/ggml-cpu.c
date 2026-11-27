@@ -2375,6 +2375,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_SAGE_ATTN:
+        case GGML_OP_SOL_ATTN:
+            GGML_ABORT("%s is not supported by the CPU backend", ggml_op_name(tensor->op));
+            break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");

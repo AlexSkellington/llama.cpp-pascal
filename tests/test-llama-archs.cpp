@@ -1122,6 +1122,8 @@ static bool check_mtp_catchup(
         }
     }
     return ok;
+}
+
 // speculative decoding: each step decodes a token and 0 to n_draft_max drafts, then rejects the drafts
 // the logits of the token must match a decode without drafts
 static double check_draft_rollback(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
