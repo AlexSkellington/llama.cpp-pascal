@@ -2882,8 +2882,22 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                 launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false,false,false,GGML_TYPE_Q4_1>,
                     8,0,32,false,false,false,false,warp_size);
             } else {
-                launch_fattn<256,32/ncols2,ncols2>(ctx,dst,lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false>,
-                    8,0,32,false,false,false,false,warp_size);
+                auto kernel = lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false>;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if constexpr (ncols2 == 2 || ncols2 == 8) {
+                    static const bool enabled = [] {
+                        const char * flag = getenv("GGML_CUDA_PASCAL_IQ4_NL_STAGED_PREFILL");
+                        return !flag || strcmp(flag, "0") != 0;
+                    }();
+                    constexpr int group = ncols2 == 2 ? 6 : 8;
+                    if (enabled && cc == GGML_CUDA_CC_DP4A && Q->ne[1] == 1024 &&
+                            Q->ne[2] == group*K->ne[2] && K->ne[1] >= 32768 && K->ne[1] <= 262144 &&
+                            (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_IQ4_NL) && V->type == GGML_TYPE_IQ4_NL) {
+                        kernel = lpdp4a_tile<256,256,32/ncols2,ncols2,false,false,false,false,true>;
+                    }
+                }
+#endif
+                launch_fattn<256,32/ncols2,ncols2>(ctx,dst,kernel,8,0,32,false,false,false,false,warp_size);
             }
             dst->src[1] = K_orig;
             dst->src[2] = V_orig;
